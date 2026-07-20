@@ -27,8 +27,8 @@ __pycache__/
 .omo/
 .claude/
 .opencode/
-CLAUDE.md
-AGENTS.md
+# CLAUDE.md
+# AGENTS.md
 
 # Logs
 logs/
