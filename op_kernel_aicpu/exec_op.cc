@@ -51,6 +51,7 @@ HcclResult ExecOp(const OpParam &param, const AlgResourceCtx &resCtx)
     // Each source owns a disjoint slot. Different sources can progress independently across channels.
     const uint64_t slotCapacity = resCtx.localBuffer.size / param.rankSize;
     const uint64_t chunkCapacity = slotCapacity - slotCapacity % typeSize;
+    const bool slotIsReused = recvBytes > chunkCapacity;
 
     // source rank 固定按 0..rankSize-1 排序；每块收到所有 ACK 后才复用工作区。
     for (uint32_t sourceRank = 0; sourceRank < param.rankSize; ++sourceRank) {
@@ -67,8 +68,11 @@ HcclResult ExecOp(const OpParam &param, const AlgResourceCtx &resCtx)
                     CHK_RET(HcommWriteWithNotifyOnThread(
                         thread, channel.handle, remoteSlot, src, chunkBytes, DATA_NOTIFY_IDX));
                 }
-                for (const auto &channel : resCtx.channels) {
-                    CHK_RET(HcommChannelNotifyWaitOnThread(thread, channel.handle, ACK_NOTIFY_IDX, CUSTOM_TIMEOUT));
+                if (slotIsReused) {
+                    for (const auto &channel : resCtx.channels) {
+                        CHK_RET(HcommChannelNotifyWaitOnThread(
+                            thread, channel.handle, ACK_NOTIFY_IDX, CUSTOM_TIMEOUT));
+                    }
                 }
             }
             continue;
@@ -82,7 +86,9 @@ HcclResult ExecOp(const OpParam &param, const AlgResourceCtx &resCtx)
             CHK_RET(HcommChannelNotifyWaitOnThread(thread, channel->handle, DATA_NOTIFY_IDX, CUSTOM_TIMEOUT));
             CHK_RET(HcommLocalReduceOnThread(thread, output + offset, localSlot,
                 chunkBytes / typeSize, HCOMM_DATA_TYPE_FP32, HCOMM_REDUCE_SUM));
-            CHK_RET(HcommChannelNotifyRecordOnThread(thread, channel->handle, ACK_NOTIFY_IDX));
+            if (slotIsReused) {
+                CHK_RET(HcommChannelNotifyRecordOnThread(thread, channel->handle, ACK_NOTIFY_IDX));
+            }
         }
     }
     return HCCL_SUCCESS;
