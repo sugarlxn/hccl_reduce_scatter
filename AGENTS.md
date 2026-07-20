@@ -65,7 +65,7 @@ bash build.sh
 ## ReduceScatter算子	
 基于给定拓扑，实现集合通信ReduceScatter算子功能，主要包括控制面的资源申请和数据面的算法逻辑实现。	
 
-1. 仅可修改指定文件：custom.h、reducescatter.cc、exec_op.cc/.h、launch_aicpu_kernel.cc/.h、aicpu_kernel.cc
+1. 选手仅允许修改 `custom.h`、`reduce_scatter.cc`、`exec_op.cc` 共 3 个文件内容。
 2. 限定使用AICPU+TS模式
 3. 算子实现需满足确定性要求，即在相同输入下（特别是浮点数输入），多次通信计算得到的输出结果相同。
 

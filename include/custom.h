@@ -33,7 +33,8 @@ struct AlgResourceCtx {
     ThreadHandle aicpuThread;          ///< AICPU_TS通信引擎上的thread资源
     CommBuffer localBuffer;            ///< 本端HCCL通信内存
     std::vector<ThreadHandle> threads; ///< AICPU_TS通信引擎上的thread资源
-    std::vector<ChannelInfo> channels; ///< AICPU_TS通信引擎上的channel资源
+    // channels 按 remoteRank 升序保存（不包含本 rank），同时作为数据面的确定性顺序。
+    std::vector<ChannelInfo> channels;  ///< AICPU_TS通信引擎上的channel资源
 
     // 序列化
     std::vector<char> Serialize()

@@ -18,6 +18,41 @@
 #include "hccl.h"
 #include "launch_aicpu_kernel.h"
 
+namespace {
+constexpr uint32_t CHANNEL_NOTIFY_NUM = 2;
+
+HcclResult FindLink(HcclComm comm, uint32_t localRank, uint32_t remoteRank, CommLink &selected)
+{
+    uint32_t *layers = nullptr;
+    uint32_t layerNum = 0;
+    CHK_RET(HcclRankGraphGetLayers(comm, &layers, &layerNum));
+    CHK_PRT_RET(layerNum == 0 || layers == nullptr, HCCL_ERROR("No network layer is available"), HCCL_E_INTERNAL);
+    for (uint32_t layerIdx = 0; layerIdx < layerNum; ++layerIdx) {
+        CommLink *links = nullptr;
+        uint32_t linkNum = 0;
+        HcclResult ret = HcclRankGraphGetLinks(comm, layers[layerIdx], localRank, remoteRank, &links, &linkNum);
+        if (ret != HCCL_SUCCESS || links == nullptr || linkNum == 0) {
+            continue;
+        }
+        selected = links[0];
+        return HCCL_SUCCESS;
+    }
+    HCCL_ERROR("No link from rank %u to rank %u", localRank, remoteRank);
+    return HCCL_E_INTERNAL;
+}
+
+HcclResult CheckParam(const OpParam &param)
+{
+    CHK_PRT_RET(param.rankSize == 0, HCCL_ERROR("rankSize must be positive"), HCCL_E_PARA);
+    CHK_PRT_RET(param.dataType != HCCL_DATA_TYPE_FP32, HCCL_ERROR("Only FP32 is supported"), HCCL_E_NOT_SUPPORT);
+    CHK_PRT_RET(param.reduceType != HCCL_REDUCE_SUM, HCCL_ERROR("Only SUM is supported"), HCCL_E_NOT_SUPPORT);
+    constexpr uint64_t typeSize = sizeof(float);
+    CHK_PRT_RET(param.count > UINT64_MAX / typeSize / param.rankSize,
+        HCCL_ERROR("ReduceScatter data size overflows uint64_t"), HCCL_E_PARA);
+    return HCCL_SUCCESS;
+}
+} // namespace
+
 HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, HcclDataType dataType,
     HcclReduceOp op, HcclComm comm, aclrtStream stream)
 {
@@ -47,6 +82,7 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
     // ==============================================
     CHK_RET(HcclGetRankId(comm, &param.myRank));
     CHK_RET(HcclGetRankSize(comm, &param.rankSize));
+    CHK_RET(CheckParam(param));
 
     // ==============================================
     // STEP 2: 创建资源
@@ -89,10 +125,8 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
         // STEP 2.2: 申请资源Thread和Channel
         // ==============================================
 
-        // TODO: 根据通信算法申请 Thread 资源
-        // 创建 AICPU_TS 通信引擎上的 thread 资源
-        uint32_t threadNum = 1;          // TODO: 按需修改所申请的 Thread 数量（>=1）
-        uint32_t notifyNumPerThread = 1; // TODO: 按需修改所申请的 Thread 上的 Notify 数量（>=1）
+        uint32_t threadNum = 1;
+        uint32_t notifyNumPerThread = 1;
 
         resCtxHost.threads.resize(threadNum);
         CHK_RET(HcclThreadAcquire(comm, aicpuTsEngine, threadNum, notifyNumPerThread, resCtxHost.threads.data()));
@@ -100,8 +134,42 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
         resCtxHost.aicpuThread = resCtxHost.threads[0];
         CHK_RET(HcclThreadExportToCommEngine(comm, 1, &resCtxHost.aicpuThread, cpuTsEngine, &param.aicpuThreadOnCpu));
 
-        // TODO: 根据通信算法申请 Channel 资源
-        // 调用 HcclRankGraphGetLinks()、HcclChannelDescInit()、HcclChannelAcquire() 等接口按需申请 Channel 资源
+        // 每个对端仅申请一个 channel。notify 1 表示数据到达，notify 0 表示工作区已消费。
+        const uint32_t channelNum = param.rankSize - 1;
+        if (channelNum > 0) {
+            std::vector<HcclChannelDesc> channelDescs(channelNum);
+            CHK_RET(HcclChannelDescInit(channelDescs.data(), channelNum));
+            resCtxHost.channels.resize(channelNum);
+            uint32_t channelIdx = 0;
+            for (uint32_t remoteRank = 0; remoteRank < param.rankSize; ++remoteRank) {
+                if (remoteRank == param.myRank) {
+                    continue;
+                }
+                CommLink link;
+                CHK_RET(FindLink(comm, param.myRank, remoteRank, link));
+                HcclChannelDesc &desc = channelDescs[channelIdx];
+                desc.remoteRank = remoteRank;
+                desc.channelProtocol = link.linkAttr.linkProtocol;
+                desc.localEndpoint = link.srcEndpointDesc;
+                desc.remoteEndpoint = link.dstEndpointDesc;
+                desc.notifyNum = CHANNEL_NOTIFY_NUM;
+                resCtxHost.channels[channelIdx].remoteRank = remoteRank;
+                resCtxHost.channels[channelIdx].notifyNum = CHANNEL_NOTIFY_NUM;
+                ++channelIdx;
+            }
+            std::vector<ChannelHandle> handles(channelNum);
+            CHK_RET(HcclChannelAcquire(comm, aicpuTsEngine, channelDescs.data(), channelNum, handles.data()));
+            for (uint32_t idx = 0; idx < channelNum; ++idx) {
+                void *remoteBuffer = nullptr;
+                uint64_t remoteBufferSize = 0;
+                CHK_RET(HcclChannelGetHcclBuffer(comm, handles[idx], &remoteBuffer, &remoteBufferSize));
+                CHK_PRT_RET(remoteBuffer == nullptr || remoteBufferSize == 0,
+                    HCCL_ERROR("Invalid remote HCCL buffer for rank %u", resCtxHost.channels[idx].remoteRank),
+                    HCCL_E_INTERNAL);
+                resCtxHost.channels[idx].handle = handles[idx];
+                resCtxHost.channels[idx].remoteCclMem = CommBuffer{remoteBuffer, remoteBufferSize};
+            }
+        }
 
         // ==============================================
         // STEP 2.3: 申请通信引擎上下文

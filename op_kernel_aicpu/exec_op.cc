@@ -13,12 +13,71 @@
 #include "exec_op.h"
 
 namespace ops_hccl {
+namespace {
+constexpr uint32_t ACK_NOTIFY_IDX = 0;
+constexpr uint32_t DATA_NOTIFY_IDX = 1;
+
+const ChannelInfo *GetChannel(const AlgResourceCtx &resCtx, uint32_t remoteRank)
+{
+    for (const auto &channel : resCtx.channels) {
+        if (channel.remoteRank == remoteRank) {
+            return &channel;
+        }
+    }
+    return nullptr;
+}
+} // namespace
+
 HcclResult ExecOp(const OpParam &param, const AlgResourceCtx &resCtx)
 {
-    HCCL_INFO("Executing AICPU Kernel on Ascend NPU");
+    CHK_PRT_RET(resCtx.threads.empty(), HCCL_ERROR("No AICPU TS thread"), HCCL_E_INTERNAL);
+    CHK_PRT_RET(param.dataType != HCCL_DATA_TYPE_FP32 || param.reduceType != HCCL_REDUCE_SUM,
+        HCCL_ERROR("Unsupported datatype or reduction"), HCCL_E_NOT_SUPPORT);
+    const ThreadHandle thread = resCtx.threads[0];
+    constexpr uint64_t typeSize = sizeof(float);
+    const uint64_t recvBytes = param.count * typeSize;
+    if (recvBytes == 0) {
+        return HCCL_SUCCESS;
+    }
+    const char *input = static_cast<const char *>(param.inputPtr);
+    char *output = static_cast<char *>(param.outputPtr);
+    const char *localPart = input + static_cast<uint64_t>(param.myRank) * recvBytes;
+    CHK_RET(HcommLocalCopyOnThread(thread, output, localPart, recvBytes));
+    if (param.rankSize == 1) {
+        return HCCL_SUCCESS;
+    }
+    CHK_PRT_RET(resCtx.localBuffer.addr == nullptr || resCtx.localBuffer.size < typeSize,
+        HCCL_ERROR("Local HCCL buffer is invalid"), HCCL_E_INTERNAL);
+    const uint64_t chunkCapacity = resCtx.localBuffer.size - resCtx.localBuffer.size % typeSize;
 
-    // TODO: 算法任务编排
-
+    // source rank 固定按 0..rankSize-1 排序；每块收到所有 ACK 后才复用工作区。
+    for (uint32_t sourceRank = 0; sourceRank < param.rankSize; ++sourceRank) {
+        if (sourceRank == param.myRank) {
+            for (uint64_t offset = 0; offset < recvBytes; offset += chunkCapacity) {
+                const uint64_t chunkBytes = (recvBytes - offset < chunkCapacity) ? recvBytes - offset : chunkCapacity;
+                for (const auto &channel : resCtx.channels) {
+                    CHK_PRT_RET(channel.remoteCclMem.addr == nullptr || channel.remoteCclMem.size < chunkBytes,
+                        HCCL_ERROR("Remote HCCL buffer is too small"), HCCL_E_INTERNAL);
+                    const char *src = input + static_cast<uint64_t>(channel.remoteRank) * recvBytes + offset;
+                    CHK_RET(HcommWriteWithNotifyOnThread(thread, channel.handle, channel.remoteCclMem.addr, src,
+                        chunkBytes, DATA_NOTIFY_IDX));
+                }
+                for (const auto &channel : resCtx.channels) {
+                    CHK_RET(HcommChannelNotifyWaitOnThread(thread, channel.handle, ACK_NOTIFY_IDX, CUSTOM_TIMEOUT));
+                }
+            }
+            continue;
+        }
+        const ChannelInfo *channel = GetChannel(resCtx, sourceRank);
+        CHK_PRT_RET(channel == nullptr, HCCL_ERROR("Missing channel to rank %u", sourceRank), HCCL_E_INTERNAL);
+        for (uint64_t offset = 0; offset < recvBytes; offset += chunkCapacity) {
+            const uint64_t chunkBytes = (recvBytes - offset < chunkCapacity) ? recvBytes - offset : chunkCapacity;
+            CHK_RET(HcommChannelNotifyWaitOnThread(thread, channel->handle, DATA_NOTIFY_IDX, CUSTOM_TIMEOUT));
+            CHK_RET(HcommLocalReduceOnThread(thread, output + offset, resCtx.localBuffer.addr,
+                chunkBytes / typeSize, HCOMM_DATA_TYPE_FP32, HCOMM_REDUCE_SUM));
+            CHK_RET(HcommChannelNotifyRecordOnThread(thread, channel->handle, ACK_NOTIFY_IDX));
+        }
+    }
     return HCCL_SUCCESS;
 }
 } // namespace ops_hccl
