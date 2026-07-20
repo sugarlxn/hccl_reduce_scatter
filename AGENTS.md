@@ -54,6 +54,13 @@ stream	输入	本rank所使用的stream。
 每天统一出1次性能分，取第二天凌晨3点前最后1次提交的代码进行性能评分。
 需保证功能用例全部通过才能参与性能评分。
 
+## 编译方法
+
+```shell
+bash build.sh
+```
+完整的Ascend 环境安装在路径: `/home/workspace`
+包括：Ascend、hccl、hcomm
 
 ## ReduceScatter算子	
 基于给定拓扑，实现集合通信ReduceScatter算子功能，主要包括控制面的资源申请和数据面的算法逻辑实现。	
@@ -61,3 +68,16 @@ stream	输入	本rank所使用的stream。
 1. 仅可修改指定文件：custom.h、reducescatter.cc、exec_op.cc/.h、launch_aicpu_kernel.cc/.h、aicpu_kernel.cc
 2. 限定使用AICPU+TS模式
 3. 算子实现需满足确定性要求，即在相同输入下（特别是浮点数输入），多次通信计算得到的输出结果相同。
+
+## 用例
+```shell
+  source /home/workspace/Ascend/cann-9.1.0/set_env.sh
+  source /home/workspace/hcomm/test/hccl_vm/hccl_vm_install/script/hccl_config.sh   # 设 RANK_TABLE_FILE 等运行变量
+  cd /home/workspace/hcomm/test/hccl_vm/hccl_vm_install/bin && ./hccl-vm start ascend950_cluster_32_server_normal.yaml
+    (hvm)$> hccl-vm mock-comm 112
+    (hvm)$> mpirun --allow-run-as-root --oversubscribe -np 2 /home/workspace/Ascend/cann-9.1.0/tools/hccl_test/bin/alltoall_test -b 64 -e 64 -d int32 -o sum -w 0 -n 1 -c 1
+    (hvm)$> hccl-vm plugin run @checker
+    (hvm)$> exit
+  更多集群配置与用例见 /home/workspace/hcomm/test/hccl_vm/README-Competition.md §4
+```
+
