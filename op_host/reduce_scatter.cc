@@ -19,7 +19,7 @@
 #include "launch_aicpu_kernel.h"
 
 namespace {
-constexpr uint32_t CHANNEL_NOTIFY_NUM = 1;
+constexpr uint32_t CHANNEL_NOTIFY_NUM = 2;
 constexpr uint32_t EXPECTED_RANK_SIZE = 16;
 constexpr uint32_t EXPECTED_LOCAL_RANK_SIZE = 8;
 
@@ -168,7 +168,7 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
         resCtxHost.aicpuThread = resCtxHost.threads[0];
         CHK_RET(HcclThreadExportToCommEngine(comm, 1, &resCtxHost.aicpuThread, cpuTsEngine, &param.aicpuThreadOnCpu));
 
-        // 每个对端仅申请一个 channel；算法在每个 channel 上仅使用一组 record/wait。
+        // 每个对端仅申请一个 channel；DATA 和 READY notify 分别负责数据到达与工作区复用同步。
         const uint32_t channelNum = param.rankSize - 1;
         if (channelNum > 0) {
             std::vector<HcclChannelDesc> channelDescs(channelNum);

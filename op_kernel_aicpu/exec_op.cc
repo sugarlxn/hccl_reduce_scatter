@@ -18,6 +18,7 @@ constexpr uint32_t LOCAL_RANK_SIZE = 8;
 constexpr uint32_t GLOBAL_RANK_SIZE = 16;
 constexpr uint32_t ROUND_NUM = 3;
 constexpr uint32_t DATA_NOTIFY_IDX = 0;
+constexpr uint32_t READY_NOTIFY_IDX = 1;
 
 const ChannelInfo *GetChannel(const AlgResourceCtx &resCtx, uint32_t remoteRank)
 {
@@ -70,9 +71,8 @@ HcclResult ExecOp(const OpParam &param, const AlgResourceCtx &resCtx)
     CHK_RET(HcommLocalReduceOnThread(thread, bufferA, input + ownedOffset, halfInputBytes / typeSize,
         HCOMM_DATA_TYPE_FP32, HCOMM_REDUCE_SUM));
 
-    // Recursive halving inside the server. Receive areas are deliberately disjoint from all live source data:
-    // round 0 uses bufferB, round 1 reuses the half of bufferA discarded in round 0, and round 2 uses the
-    // unused tail of that same half. Therefore every channel needs exactly one record/wait pair and no ACK.
+    // Recursive halving inside the server. Round 0 uses bufferB. Later rounds reuse discarded bufferA regions;
+    // a READY handshake orders each remote write after all earlier work on the destination rank.
     const char *activeSrc = bufferA;
     uint32_t activeCount = LOCAL_RANK_SIZE;
     uint64_t activeOffset = 0;
@@ -105,6 +105,11 @@ HcclResult ExecOp(const OpParam &param, const AlgResourceCtx &resCtx)
         const uint64_t halfBytes = static_cast<uint64_t>(halfCount) * recvBytes;
         const char *sendSrc = activeSrc + static_cast<uint64_t>(sendOffsetInChunk) * recvBytes;
         char *remoteRecvDst = static_cast<char *>(channel->remoteCclMem.addr) + recvOffset;
+        if (round > 0) {
+            CHK_RET(HcommChannelNotifyRecordOnThread(thread, channel->handle, READY_NOTIFY_IDX));
+            CHK_RET(HcommChannelNotifyWaitOnThread(
+                thread, channel->handle, READY_NOTIFY_IDX, CUSTOM_TIMEOUT));
+        }
         CHK_RET(HcommWriteOnThread(thread, channel->handle, remoteRecvDst, sendSrc, halfBytes));
         CHK_RET(HcommChannelNotifyRecordOnThread(thread, channel->handle, DATA_NOTIFY_IDX));
         CHK_RET(HcommChannelNotifyWaitOnThread(thread, channel->handle, DATA_NOTIFY_IDX, CUSTOM_TIMEOUT));
