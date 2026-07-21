@@ -19,7 +19,9 @@
 #include "launch_aicpu_kernel.h"
 
 namespace {
-constexpr uint32_t CHANNEL_NOTIFY_NUM = 2;
+constexpr uint32_t CHANNEL_NOTIFY_NUM = 1;
+constexpr uint32_t EXPECTED_RANK_SIZE = 16;
+constexpr uint32_t EXPECTED_LOCAL_RANK_SIZE = 8;
 
 HcclResult FindLink(HcclComm comm, uint32_t localRank, uint32_t remoteRank, CommLink &selected)
 {
@@ -49,6 +51,37 @@ HcclResult CheckParam(const OpParam &param)
     constexpr uint64_t typeSize = sizeof(float);
     CHK_PRT_RET(param.count > UINT64_MAX / typeSize / param.rankSize,
         HCCL_ERROR("ReduceScatter data size overflows uint64_t"), HCCL_E_PARA);
+    return HCCL_SUCCESS;
+}
+
+HcclResult GetLocalTopology(HcclComm comm, const OpParam &param, AlgResourceCtx &resCtx)
+{
+    uint32_t *layers = nullptr;
+    uint32_t layerNum = 0;
+    CHK_RET(HcclRankGraphGetLayers(comm, &layers, &layerNum));
+    for (uint32_t layerIdx = 0; layerIdx < layerNum; ++layerIdx) {
+        uint32_t *ranks = nullptr;
+        uint32_t rankNum = 0;
+        CHK_RET(HcclRankGraphGetRanksByLayer(comm, layers[layerIdx], &ranks, &rankNum));
+        if (rankNum != EXPECTED_LOCAL_RANK_SIZE || ranks == nullptr) {
+            continue;
+        }
+        resCtx.localRanks.assign(ranks, ranks + rankNum);
+        for (uint32_t idx = 0; idx < rankNum; ++idx) {
+            if (ranks[idx] == param.myRank) {
+                resCtx.localRankIndex = idx;
+                break;
+            }
+        }
+        break;
+    }
+    CHK_PRT_RET(param.rankSize != EXPECTED_RANK_SIZE || resCtx.localRanks.size() != EXPECTED_LOCAL_RANK_SIZE ||
+            resCtx.localRankIndex == INVALID_VALUE_RANKID,
+        HCCL_ERROR("Expected a 2x8 topology, rankSize=%u, localRankSize=%zu", param.rankSize,
+            resCtx.localRanks.size()),
+        HCCL_E_NOT_SUPPORT);
+    resCtx.partnerRank = param.myRank < EXPECTED_LOCAL_RANK_SIZE ? param.myRank + EXPECTED_LOCAL_RANK_SIZE :
+                                                                   param.myRank - EXPECTED_LOCAL_RANK_SIZE;
     return HCCL_SUCCESS;
 }
 } // namespace
@@ -120,6 +153,7 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
         uint64_t cclBufferSize;
         CHK_RET(HcclGetHcclBuffer(comm, &cclBufferAddr, &cclBufferSize));
         resCtxHost.localBuffer = CommBuffer{cclBufferAddr, cclBufferSize};
+        CHK_RET(GetLocalTopology(comm, param, resCtxHost));
 
         // ==============================================
         // STEP 2.2: 申请资源Thread和Channel
@@ -134,7 +168,7 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
         resCtxHost.aicpuThread = resCtxHost.threads[0];
         CHK_RET(HcclThreadExportToCommEngine(comm, 1, &resCtxHost.aicpuThread, cpuTsEngine, &param.aicpuThreadOnCpu));
 
-        // 每个对端仅申请一个 channel。notify 1 表示数据到达，notify 0 表示工作区已消费。
+        // 每个对端仅申请一个 channel；算法在每个 channel 上仅使用一组 record/wait。
         const uint32_t channelNum = param.rankSize - 1;
         if (channelNum > 0) {
             std::vector<HcclChannelDesc> channelDescs(channelNum);

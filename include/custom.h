@@ -32,6 +32,9 @@ struct ChannelInfo {
 struct AlgResourceCtx {
     ThreadHandle aicpuThread;          ///< AICPU_TS通信引擎上的thread资源
     CommBuffer localBuffer;            ///< 本端HCCL通信内存
+    uint32_t localRankIndex = INVALID_VALUE_RANKID;
+    uint32_t partnerRank = INVALID_VALUE_RANKID;
+    std::vector<uint32_t> localRanks;
     std::vector<ThreadHandle> threads; ///< AICPU_TS通信引擎上的thread资源
     // channels 按 remoteRank 升序保存（不包含本 rank），同时作为数据面的确定性顺序。
     std::vector<ChannelInfo> channels;  ///< AICPU_TS通信引擎上的channel资源
@@ -42,6 +45,9 @@ struct AlgResourceCtx {
         BinaryStream binaryStream;
         binaryStream << aicpuThread;
         binaryStream << localBuffer;
+        binaryStream << localRankIndex;
+        binaryStream << partnerRank;
+        binaryStream << localRanks;
         binaryStream << threads;
         binaryStream << channels;
         std::vector<char> result;
@@ -55,6 +61,9 @@ struct AlgResourceCtx {
         BinaryStream binaryStream(data);
         binaryStream >> aicpuThread;
         binaryStream >> localBuffer;
+        binaryStream >> localRankIndex;
+        binaryStream >> partnerRank;
+        binaryStream >> localRanks;
         binaryStream >> threads;
         binaryStream >> channels;
     }

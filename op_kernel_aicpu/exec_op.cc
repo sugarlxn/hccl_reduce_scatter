@@ -14,8 +14,10 @@
 
 namespace ops_hccl {
 namespace {
-constexpr uint32_t ACK_NOTIFY_IDX = 0;
-constexpr uint32_t DATA_NOTIFY_IDX = 1;
+constexpr uint32_t LOCAL_RANK_SIZE = 8;
+constexpr uint32_t GLOBAL_RANK_SIZE = 16;
+constexpr uint32_t ROUND_NUM = 3;
+constexpr uint32_t DATA_NOTIFY_IDX = 0;
 
 const ChannelInfo *GetChannel(const AlgResourceCtx &resCtx, uint32_t remoteRank)
 {
@@ -39,56 +41,84 @@ HcclResult ExecOp(const OpParam &param, const AlgResourceCtx &resCtx)
     if (recvBytes == 0) {
         return HCCL_SUCCESS;
     }
+    CHK_PRT_RET(param.rankSize != GLOBAL_RANK_SIZE || resCtx.localRanks.size() != LOCAL_RANK_SIZE ||
+            resCtx.localRankIndex >= LOCAL_RANK_SIZE || resCtx.partnerRank >= GLOBAL_RANK_SIZE,
+        HCCL_ERROR("Invalid hierarchical topology"), HCCL_E_INTERNAL);
+
+    const uint64_t halfInputBytes = recvBytes * (GLOBAL_RANK_SIZE / 2);
+    const uint64_t quarterInputBytes = recvBytes * (GLOBAL_RANK_SIZE / 4);
+    const uint64_t workspaceBytes = halfInputBytes + quarterInputBytes;
+    CHK_PRT_RET(resCtx.localBuffer.addr == nullptr || resCtx.localBuffer.size < workspaceBytes,
+        HCCL_ERROR("HCCL buffer is too small, need %lu bytes", workspaceBytes), HCCL_E_INTERNAL);
+
     const char *input = static_cast<const char *>(param.inputPtr);
     char *output = static_cast<char *>(param.outputPtr);
-    const char *localPart = input + static_cast<uint64_t>(param.myRank) * recvBytes;
-    CHK_RET(HcommLocalCopyOnThread(thread, output, localPart, recvBytes));
-    if (param.rankSize == 1) {
-        return HCCL_SUCCESS;
-    }
-    CHK_PRT_RET(resCtx.localBuffer.addr == nullptr || resCtx.localBuffer.size < typeSize * param.rankSize,
-        HCCL_ERROR("Local HCCL buffer is invalid"), HCCL_E_INTERNAL);
-    // Each source owns a disjoint slot. Different sources can progress independently across channels.
-    const uint64_t slotCapacity = resCtx.localBuffer.size / param.rankSize;
-    const uint64_t chunkCapacity = slotCapacity - slotCapacity % typeSize;
-    const bool slotIsReused = recvBytes > chunkCapacity;
+    char *bufferA = static_cast<char *>(resCtx.localBuffer.addr);
+    char *bufferB = bufferA + halfInputBytes;
+    // First reduce corresponding source ranks across servers. Each side sends the target half owned by its peer.
+    const ChannelInfo *crossChannel = GetChannel(resCtx, resCtx.partnerRank);
+    CHK_PRT_RET(crossChannel == nullptr || crossChannel->remoteCclMem.addr == nullptr ||
+            crossChannel->remoteCclMem.size < workspaceBytes,
+        HCCL_ERROR("Invalid cross-server partner channel"), HCCL_E_INTERNAL);
+    const bool firstServer = param.myRank < LOCAL_RANK_SIZE;
+    const uint64_t ownedOffset = firstServer ? 0 : halfInputBytes;
+    const uint64_t sendOffset = firstServer ? halfInputBytes : 0;
+    CHK_RET(HcommWriteOnThread(thread, crossChannel->handle, crossChannel->remoteCclMem.addr,
+        input + sendOffset, halfInputBytes));
+    CHK_RET(HcommChannelNotifyRecordOnThread(thread, crossChannel->handle, DATA_NOTIFY_IDX));
+    CHK_RET(HcommChannelNotifyWaitOnThread(thread, crossChannel->handle, DATA_NOTIFY_IDX, CUSTOM_TIMEOUT));
+    CHK_RET(HcommLocalReduceOnThread(thread, bufferA, input + ownedOffset, halfInputBytes / typeSize,
+        HCOMM_DATA_TYPE_FP32, HCOMM_REDUCE_SUM));
 
-    // source rank 固定按 0..rankSize-1 排序；每块收到所有 ACK 后才复用工作区。
-    for (uint32_t sourceRank = 0; sourceRank < param.rankSize; ++sourceRank) {
-        if (sourceRank == param.myRank) {
-            for (uint64_t offset = 0; offset < recvBytes; offset += chunkCapacity) {
-                const uint64_t chunkBytes = (recvBytes - offset < chunkCapacity) ? recvBytes - offset : chunkCapacity;
-                for (const auto &channel : resCtx.channels) {
-                    const uint64_t remoteSlotCapacity = channel.remoteCclMem.size / param.rankSize;
-                    CHK_PRT_RET(channel.remoteCclMem.addr == nullptr || remoteSlotCapacity < chunkBytes,
-                        HCCL_ERROR("Remote HCCL buffer is too small"), HCCL_E_INTERNAL);
-                    const char *src = input + static_cast<uint64_t>(channel.remoteRank) * recvBytes + offset;
-                    char *remoteSlot = static_cast<char *>(channel.remoteCclMem.addr) +
-                        static_cast<uint64_t>(sourceRank) * remoteSlotCapacity;
-                    CHK_RET(HcommWriteWithNotifyOnThread(
-                        thread, channel.handle, remoteSlot, src, chunkBytes, DATA_NOTIFY_IDX));
-                }
-                if (slotIsReused) {
-                    for (const auto &channel : resCtx.channels) {
-                        CHK_RET(HcommChannelNotifyWaitOnThread(
-                            thread, channel.handle, ACK_NOTIFY_IDX, CUSTOM_TIMEOUT));
-                    }
-                }
-            }
-            continue;
+    // Recursive halving inside the server. Receive areas are deliberately disjoint from all live source data:
+    // round 0 uses bufferB, round 1 reuses the half of bufferA discarded in round 0, and round 2 uses the
+    // unused tail of that same half. Therefore every channel needs exactly one record/wait pair and no ACK.
+    const char *activeSrc = bufferA;
+    uint32_t activeCount = LOCAL_RANK_SIZE;
+    uint64_t activeOffset = 0;
+    for (uint32_t round = 0; round < ROUND_NUM; ++round) {
+        const uint32_t mask = LOCAL_RANK_SIZE >> (round + 1);
+        const uint32_t halfCount = activeCount / 2;
+        const bool keepUpper = (resCtx.localRankIndex & mask) != 0;
+        const uint32_t keepOffset = keepUpper ? halfCount : 0;
+        const uint32_t sendOffsetInChunk = keepUpper ? 0 : halfCount;
+        const uint32_t partnerIndex = resCtx.localRankIndex ^ mask;
+        const ChannelInfo *channel = GetChannel(resCtx, resCtx.localRanks[partnerIndex]);
+        CHK_PRT_RET(channel == nullptr || channel->remoteCclMem.addr == nullptr ||
+                channel->remoteCclMem.size < workspaceBytes,
+            HCCL_ERROR("Invalid local partner channel"), HCCL_E_INTERNAL);
+
+        char *recvDst = nullptr;
+        uint64_t recvOffset = 0;
+        if (round == 0) {
+            recvDst = bufferB;
+            recvOffset = halfInputBytes;
+        } else if (round == 1) {
+            activeOffset = (resCtx.localRankIndex & (LOCAL_RANK_SIZE / 2)) != 0 ? 0 : quarterInputBytes;
+            recvDst = bufferA + activeOffset;
+            recvOffset = activeOffset;
+        } else {
+            recvDst = bufferA + activeOffset + 2 * recvBytes;
+            recvOffset = activeOffset + 2 * recvBytes;
         }
-        const ChannelInfo *channel = GetChannel(resCtx, sourceRank);
-        CHK_PRT_RET(channel == nullptr, HCCL_ERROR("Missing channel to rank %u", sourceRank), HCCL_E_INTERNAL);
-        const char *localSlot = static_cast<const char *>(resCtx.localBuffer.addr) +
-            static_cast<uint64_t>(sourceRank) * slotCapacity;
-        for (uint64_t offset = 0; offset < recvBytes; offset += chunkCapacity) {
-            const uint64_t chunkBytes = (recvBytes - offset < chunkCapacity) ? recvBytes - offset : chunkCapacity;
-            CHK_RET(HcommChannelNotifyWaitOnThread(thread, channel->handle, DATA_NOTIFY_IDX, CUSTOM_TIMEOUT));
-            CHK_RET(HcommLocalReduceOnThread(thread, output + offset, localSlot,
-                chunkBytes / typeSize, HCOMM_DATA_TYPE_FP32, HCOMM_REDUCE_SUM));
-            if (slotIsReused) {
-                CHK_RET(HcommChannelNotifyRecordOnThread(thread, channel->handle, ACK_NOTIFY_IDX));
-            }
+
+        const uint64_t halfBytes = static_cast<uint64_t>(halfCount) * recvBytes;
+        const char *sendSrc = activeSrc + static_cast<uint64_t>(sendOffsetInChunk) * recvBytes;
+        char *remoteRecvDst = static_cast<char *>(channel->remoteCclMem.addr) + recvOffset;
+        CHK_RET(HcommWriteOnThread(thread, channel->handle, remoteRecvDst, sendSrc, halfBytes));
+        CHK_RET(HcommChannelNotifyRecordOnThread(thread, channel->handle, DATA_NOTIFY_IDX));
+        CHK_RET(HcommChannelNotifyWaitOnThread(thread, channel->handle, DATA_NOTIFY_IDX, CUSTOM_TIMEOUT));
+
+        const char *keepSrc = activeSrc + static_cast<uint64_t>(keepOffset) * recvBytes;
+        if (round == ROUND_NUM - 1) {
+            CHK_RET(HcommLocalCopyOnThread(thread, output, keepSrc, recvBytes));
+            CHK_RET(HcommLocalReduceOnThread(
+                thread, output, recvDst, param.count, HCOMM_DATA_TYPE_FP32, HCOMM_REDUCE_SUM));
+        } else {
+            CHK_RET(HcommLocalReduceOnThread(
+                thread, recvDst, keepSrc, halfBytes / typeSize, HCOMM_DATA_TYPE_FP32, HCOMM_REDUCE_SUM));
+            activeSrc = recvDst;
+            activeCount = halfCount;
         }
     }
     return HCCL_SUCCESS;
