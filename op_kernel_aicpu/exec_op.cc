@@ -211,8 +211,10 @@ HcclResult ExecLargeMessagePipelined(const OpParam &param, const AlgResourceCtx 
     CHK_RET(HcommChannelNotifyWaitOnThread(mainThread, crossChannel.handle, DATA_NOTIFY_IDX, CUSTOM_TIMEOUT));
     for (uint32_t chunk = 0; chunk < LOCAL_RANK_SIZE; ++chunk) {
         const uint64_t chunkOffset = static_cast<uint64_t>(chunk) * recvBytes;
-        CHK_RET(HcommLocalReduceOnThread(mainThread, bufferA + chunkOffset, input + ownedOffset + chunkOffset, firstTileCount, HCOMM_DATA_TYPE_FP32, HCOMM_REDUCE_SUM));
         if (chunk == resCtx.localRankIndex) {
+            CHK_RET(HcommLocalReduceOnThread(mainThread, bufferA + chunkOffset,
+                input + ownedOffset + chunkOffset, firstTileCount, HCOMM_DATA_TYPE_FP32,
+                HCOMM_REDUCE_SUM));
             CHK_RET(HcommLocalCopyOnThread(mainThread, output, bufferA + chunkOffset, firstTileBytes));
             continue;
         }
@@ -224,6 +226,8 @@ HcclResult ExecLargeMessagePipelined(const OpParam &param, const AlgResourceCtx 
         CHK_PRT_RET(channel == nullptr || channel->remoteCclMem.addr == nullptr || channel->remoteCclMem.size < remoteOffset + firstTileBytes, HCCL_ERROR("Invalid tile-0 local channel"), HCCL_E_INTERNAL);
         CHK_RET(HcommThreadNotifyRecordOnThread(mainThread, worker, 0));
         CHK_RET(HcommThreadNotifyWaitOnThread(worker, 0, CUSTOM_TIMEOUT));
+        CHK_RET(HcommLocalReduceOnThread(worker, bufferA + chunkOffset, input + ownedOffset + chunkOffset,
+            firstTileCount, HCOMM_DATA_TYPE_FP32, HCOMM_REDUCE_SUM));
         CHK_RET(HcommWriteOnThread(worker, channel->handle, static_cast<char *>(channel->remoteCclMem.addr) + remoteOffset, bufferA + static_cast<uint64_t>(chunk) * recvBytes, firstTileBytes));
         CHK_RET(HcommChannelNotifyRecordOnThread(worker, channel->handle, DATA_NOTIFY_IDX));
         CHK_RET(HcommChannelNotifyWaitOnThread(worker, channel->handle, DATA_NOTIFY_IDX, CUSTOM_TIMEOUT));
@@ -232,20 +236,26 @@ HcclResult ExecLargeMessagePipelined(const OpParam &param, const AlgResourceCtx 
     CHK_RET(HcommChannelNotifyWaitOnThread(mainThread, crossChannel.handle, DATA_NOTIFY_IDX, CUSTOM_TIMEOUT));
     for (uint32_t chunk = 0; chunk < LOCAL_RANK_SIZE; ++chunk) {
         const uint64_t chunkOffset = static_cast<uint64_t>(chunk) * recvBytes + secondTileOffset;
-        CHK_RET(HcommLocalReduceOnThread(mainThread, bufferA + chunkOffset, input + ownedOffset + chunkOffset, secondTileCount, HCOMM_DATA_TYPE_FP32, HCOMM_REDUCE_SUM));
         if (chunk == resCtx.localRankIndex) {
-            CHK_RET(HcommLocalCopyOnThread(mainThread, output + secondTileOffset, bufferA + chunkOffset, secondTileBytes));
+            CHK_RET(HcommLocalReduceOnThread(mainThread, bufferA + chunkOffset,
+                input + ownedOffset + chunkOffset, secondTileCount, HCOMM_DATA_TYPE_FP32,
+                HCOMM_REDUCE_SUM));
+            CHK_RET(HcommLocalCopyOnThread(
+                mainThread, output + secondTileOffset, bufferA + chunkOffset, secondTileBytes));
+            continue;
         }
+        const uint32_t workerOrdinal = PeerSlot(resCtx.localRankIndex, chunk);
+        const ThreadHandle worker = resCtx.threads[workerOrdinal + 2];
+        // Queue this independent pair reduction behind the worker's tile-0 transfer. Its completion notify is
+        // consumed before the later tile-1 transfer completion notify.
+        CHK_RET(HcommThreadNotifyRecordOnThread(mainThread, worker, 0));
+        CHK_RET(HcommThreadNotifyWaitOnThread(worker, 0, CUSTOM_TIMEOUT));
+        CHK_RET(HcommLocalReduceOnThread(worker, bufferA + chunkOffset, input + ownedOffset + chunkOffset,
+            secondTileCount, HCOMM_DATA_TYPE_FP32, HCOMM_REDUCE_SUM));
+        CHK_RET(HcommThreadNotifyRecordOnThread(worker, mainThread, workerOrdinal + 1));
     }
     for (uint32_t workerOrdinal = 0; workerOrdinal < LOCAL_RANK_SIZE - 1; ++workerOrdinal) {
         CHK_RET(HcommThreadNotifyWaitOnThread(mainThread, workerOrdinal + 1, CUSTOM_TIMEOUT));
-    }
-    for (uint32_t peer = 0; peer < LOCAL_RANK_SIZE; ++peer) {
-        if (peer == resCtx.localRankIndex) {
-            continue;
-        }
-        const uint32_t localSlot = PeerSlot(resCtx.localRankIndex, peer);
-        CHK_RET(HcommLocalReduceOnThread(mainThread, output, bufferB + static_cast<uint64_t>(localSlot) * slotStride, firstTileCount, HCOMM_DATA_TYPE_FP32, HCOMM_REDUCE_SUM));
     }
     for (uint32_t peer = 0; peer < LOCAL_RANK_SIZE; ++peer) {
         if (peer == resCtx.localRankIndex) {
@@ -255,6 +265,11 @@ HcclResult ExecLargeMessagePipelined(const OpParam &param, const AlgResourceCtx 
         const ThreadHandle worker = resCtx.threads[workerOrdinal + 2];
         const ChannelInfo *channel = GetChannel(resCtx, resCtx.localRanks[peer]);
         const uint32_t remoteSlot = PeerSlot(peer, resCtx.localRankIndex);
+        const uint32_t localSlot = PeerSlot(resCtx.localRankIndex, peer);
+        // Consume this peer's tile-0 slot before allowing its worker to reuse the slot for tile 1. Peers are
+        // still accumulated in ascending order, while later tile-0 reductions overlap earlier tile-1 writes.
+        CHK_RET(HcommLocalReduceOnThread(mainThread, output, bufferB +
+            static_cast<uint64_t>(localSlot) * slotStride, firstTileCount, HCOMM_DATA_TYPE_FP32, HCOMM_REDUCE_SUM));
         const uint64_t remoteOffset = halfInputBytes + static_cast<uint64_t>(remoteSlot) * slotStride;
         CHK_PRT_RET(channel == nullptr || channel->remoteCclMem.addr == nullptr || channel->remoteCclMem.size < remoteOffset + secondTileBytes, HCCL_ERROR("Invalid tile-1 local channel"), HCCL_E_INTERNAL);
         CHK_RET(HcommThreadNotifyRecordOnThread(mainThread, worker, 0));
@@ -266,15 +281,43 @@ HcclResult ExecLargeMessagePipelined(const OpParam &param, const AlgResourceCtx 
         CHK_RET(HcommChannelNotifyWaitOnThread(worker, channel->handle, DATA_NOTIFY_IDX, CUSTOM_TIMEOUT));
         CHK_RET(HcommThreadNotifyRecordOnThread(worker, mainThread, workerOrdinal + 1));
     }
-    for (uint32_t workerOrdinal = 0; workerOrdinal < LOCAL_RANK_SIZE - 1; ++workerOrdinal) {
-        CHK_RET(HcommThreadNotifyWaitOnThread(mainThread, workerOrdinal + 1, CUSTOM_TIMEOUT));
+    for (uint32_t completion = 0; completion < 2; ++completion) {
+        for (uint32_t workerOrdinal = 0; workerOrdinal < LOCAL_RANK_SIZE - 1; ++workerOrdinal) {
+            CHK_RET(HcommThreadNotifyWaitOnThread(mainThread, workerOrdinal + 1, CUSTOM_TIMEOUT));
+        }
     }
+    // The second tile is the unhidden tail. Partition its output across all eight threads; within every
+    // partition peers are still accumulated in ascending order, preserving each element's FP32 operation order.
+    for (uint32_t partition = 1; partition < LOCAL_RANK_SIZE; ++partition) {
+        const uint32_t workerOrdinal = partition - 1;
+        const ThreadHandle worker = resCtx.threads[workerOrdinal + 2];
+        const uint64_t begin = secondTileCount * partition / LOCAL_RANK_SIZE;
+        const uint64_t end = secondTileCount * (partition + 1) / LOCAL_RANK_SIZE;
+        CHK_RET(HcommThreadNotifyRecordOnThread(mainThread, worker, 0));
+        CHK_RET(HcommThreadNotifyWaitOnThread(worker, 0, CUSTOM_TIMEOUT));
+        for (uint32_t peer = 0; peer < LOCAL_RANK_SIZE; ++peer) {
+            if (peer == resCtx.localRankIndex) {
+                continue;
+            }
+            const uint32_t localSlot = PeerSlot(resCtx.localRankIndex, peer);
+            CHK_RET(HcommLocalReduceOnThread(worker, output + secondTileOffset + begin * sizeof(float),
+                bufferB + static_cast<uint64_t>(localSlot) * slotStride + begin * sizeof(float), end - begin,
+                HCOMM_DATA_TYPE_FP32, HCOMM_REDUCE_SUM));
+        }
+        CHK_RET(HcommThreadNotifyRecordOnThread(worker, mainThread, workerOrdinal + 1));
+    }
+    const uint64_t mainEnd = secondTileCount / LOCAL_RANK_SIZE;
     for (uint32_t peer = 0; peer < LOCAL_RANK_SIZE; ++peer) {
         if (peer == resCtx.localRankIndex) {
             continue;
         }
         const uint32_t localSlot = PeerSlot(resCtx.localRankIndex, peer);
-        CHK_RET(HcommLocalReduceOnThread(mainThread, output + secondTileOffset, bufferB + static_cast<uint64_t>(localSlot) * slotStride, secondTileCount, HCOMM_DATA_TYPE_FP32, HCOMM_REDUCE_SUM));
+        CHK_RET(HcommLocalReduceOnThread(mainThread, output + secondTileOffset,
+            bufferB + static_cast<uint64_t>(localSlot) * slotStride, mainEnd, HCOMM_DATA_TYPE_FP32,
+            HCOMM_REDUCE_SUM));
+    }
+    for (uint32_t workerOrdinal = 0; workerOrdinal < LOCAL_RANK_SIZE - 1; ++workerOrdinal) {
+        CHK_RET(HcommThreadNotifyWaitOnThread(mainThread, workerOrdinal + 1, CUSTOM_TIMEOUT));
     }
     return HCCL_SUCCESS;
 }
