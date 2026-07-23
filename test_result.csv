@@ -2,3 +2,4 @@
 1,benchmark,2026/07/21 14:13:12,88.93,pass,pass,pass,pass,42.00μs,1.38ms,1.06ms
 13,lxn,2026/07/20 21:04:22,63.07,pass,pass,pass,pass,846.00μs,82.5ms,42.7ms
 12,lxn,2026/07/21 21:48:15,73.15,pass,pass,pass,pass,42.00μs,6.06ms,4.74ms
+21,lxn,2026/07/22 19:46:01,75.44,pass,pass,pass,pass,42.00μs,2.48ms,1.94ms

@@ -22,7 +22,8 @@ namespace {
 constexpr uint32_t CHANNEL_NOTIFY_NUM = 2;
 constexpr uint32_t EXPECTED_RANK_SIZE = 16;
 constexpr uint32_t EXPECTED_LOCAL_RANK_SIZE = 8;
-constexpr uint32_t AICPU_THREAD_NUM = EXPECTED_LOCAL_RANK_SIZE;
+// One coordinator, one dedicated Clos worker and seven full-mesh workers.
+constexpr uint32_t AICPU_THREAD_NUM = EXPECTED_LOCAL_RANK_SIZE + 1;
 
 HcclResult FindLink(HcclComm comm, uint32_t localRank, uint32_t remoteRank, CommLink &selected)
 {
@@ -160,11 +161,11 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
         // STEP 2.2: 申请资源Thread和Channel
         // ==============================================
 
-        // Thread 0 drives the Clos exchange and local reductions. The other seven threads each drive one
-        // full-mesh peer, allowing large messages to use all direct links concurrently. Notify 0 remains the
-        // host/device rendezvous (and worker start gate); notify 1..7 on thread 0 are worker completion gates.
+        // Thread 0 coordinates reductions, thread 1 drives the Clos link, and threads 2..8 each drive one
+        // full-mesh peer. Notify 0 remains the host/device rendezvous (and worker start gate); notify 1..7 on
+        // thread 0 are worker completion gates.
         uint32_t threadNum = AICPU_THREAD_NUM;
-        uint32_t notifyNumPerThread = AICPU_THREAD_NUM;
+        uint32_t notifyNumPerThread = EXPECTED_LOCAL_RANK_SIZE;
 
         resCtxHost.threads.resize(threadNum);
         CHK_RET(HcclThreadAcquire(comm, aicpuTsEngine, threadNum, notifyNumPerThread, resCtxHost.threads.data()));
