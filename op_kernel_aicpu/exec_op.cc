@@ -206,7 +206,8 @@ HcclResult ExecLargeMessagePipelined(const OpParam &param, const AlgResourceCtx 
             const uint64_t chunkOffset = static_cast<uint64_t>(chunk) * recvBytes + tileOffset;
             CHK_RET(HcommWriteOnThread(crossThread, crossChannel.handle, static_cast<char *>(crossChannel.remoteCclMem.addr) + chunkOffset, input + sendOffset + chunkOffset, tileBytes));
         }
-        CHK_RET(HcommChannelNotifyRecordOnThread(crossThread, crossChannel.handle, DATA_NOTIFY_IDX));
+        const uint32_t tileNotifyIdx = tile == 0 ? DATA_NOTIFY_IDX : READY_NOTIFY_IDX;
+        CHK_RET(HcommChannelNotifyRecordOnThread(crossThread, crossChannel.handle, tileNotifyIdx));
     }
     CHK_RET(HcommChannelNotifyWaitOnThread(mainThread, crossChannel.handle, DATA_NOTIFY_IDX, CUSTOM_TIMEOUT));
     for (uint32_t chunk = 0; chunk < LOCAL_RANK_SIZE; ++chunk) {
@@ -231,9 +232,8 @@ HcclResult ExecLargeMessagePipelined(const OpParam &param, const AlgResourceCtx 
         CHK_RET(HcommWriteOnThread(worker, channel->handle, static_cast<char *>(channel->remoteCclMem.addr) + remoteOffset, bufferA + static_cast<uint64_t>(chunk) * recvBytes, firstTileBytes));
         CHK_RET(HcommChannelNotifyRecordOnThread(worker, channel->handle, DATA_NOTIFY_IDX));
         CHK_RET(HcommChannelNotifyWaitOnThread(worker, channel->handle, DATA_NOTIFY_IDX, CUSTOM_TIMEOUT));
-        CHK_RET(HcommThreadNotifyRecordOnThread(worker, mainThread, workerOrdinal + 1));
     }
-    CHK_RET(HcommChannelNotifyWaitOnThread(mainThread, crossChannel.handle, DATA_NOTIFY_IDX, CUSTOM_TIMEOUT));
+    CHK_RET(HcommChannelNotifyWaitOnThread(mainThread, crossChannel.handle, READY_NOTIFY_IDX, CUSTOM_TIMEOUT));
     for (uint32_t chunk = 0; chunk < LOCAL_RANK_SIZE; ++chunk) {
         const uint64_t chunkOffset = static_cast<uint64_t>(chunk) * recvBytes + secondTileOffset;
         if (chunk == resCtx.localRankIndex) {
@@ -246,10 +246,10 @@ HcclResult ExecLargeMessagePipelined(const OpParam &param, const AlgResourceCtx 
         }
         const uint32_t workerOrdinal = PeerSlot(resCtx.localRankIndex, chunk);
         const ThreadHandle worker = resCtx.threads[workerOrdinal + 2];
-        // Queue this independent pair reduction behind the worker's tile-0 transfer. Its completion notify is
-        // consumed before the later tile-1 transfer completion notify.
-        CHK_RET(HcommThreadNotifyRecordOnThread(mainThread, worker, 0));
-        CHK_RET(HcommThreadNotifyWaitOnThread(worker, 0, CUSTOM_TIMEOUT));
+        // Start tile-1 reduction with a distinct worker notify. The worker executes it after its queued tile-0
+        // transfer, while the main-thread record remains ordered after the second Clos tile arrives.
+        CHK_RET(HcommThreadNotifyRecordOnThread(mainThread, worker, 1));
+        CHK_RET(HcommThreadNotifyWaitOnThread(worker, 1, CUSTOM_TIMEOUT));
         CHK_RET(HcommLocalReduceOnThread(worker, bufferA + chunkOffset, input + ownedOffset + chunkOffset,
             secondTileCount, HCOMM_DATA_TYPE_FP32, HCOMM_REDUCE_SUM));
         CHK_RET(HcommThreadNotifyRecordOnThread(worker, mainThread, workerOrdinal + 1));
@@ -272,8 +272,8 @@ HcclResult ExecLargeMessagePipelined(const OpParam &param, const AlgResourceCtx 
             static_cast<uint64_t>(localSlot) * slotStride, firstTileCount, HCOMM_DATA_TYPE_FP32, HCOMM_REDUCE_SUM));
         const uint64_t remoteOffset = halfInputBytes + static_cast<uint64_t>(remoteSlot) * slotStride;
         CHK_PRT_RET(channel == nullptr || channel->remoteCclMem.addr == nullptr || channel->remoteCclMem.size < remoteOffset + secondTileBytes, HCCL_ERROR("Invalid tile-1 local channel"), HCCL_E_INTERNAL);
-        CHK_RET(HcommThreadNotifyRecordOnThread(mainThread, worker, 0));
-        CHK_RET(HcommThreadNotifyWaitOnThread(worker, 0, CUSTOM_TIMEOUT));
+        CHK_RET(HcommThreadNotifyRecordOnThread(mainThread, worker, 2));
+        CHK_RET(HcommThreadNotifyWaitOnThread(worker, 2, CUSTOM_TIMEOUT));
         CHK_RET(HcommChannelNotifyRecordOnThread(worker, channel->handle, READY_NOTIFY_IDX));
         CHK_RET(HcommChannelNotifyWaitOnThread(worker, channel->handle, READY_NOTIFY_IDX, CUSTOM_TIMEOUT));
         CHK_RET(HcommWriteOnThread(worker, channel->handle, static_cast<char *>(channel->remoteCclMem.addr) + remoteOffset, bufferA + static_cast<uint64_t>(peer) * recvBytes + secondTileOffset, secondTileBytes));
@@ -281,10 +281,8 @@ HcclResult ExecLargeMessagePipelined(const OpParam &param, const AlgResourceCtx 
         CHK_RET(HcommChannelNotifyWaitOnThread(worker, channel->handle, DATA_NOTIFY_IDX, CUSTOM_TIMEOUT));
         CHK_RET(HcommThreadNotifyRecordOnThread(worker, mainThread, workerOrdinal + 1));
     }
-    for (uint32_t completion = 0; completion < 2; ++completion) {
-        for (uint32_t workerOrdinal = 0; workerOrdinal < LOCAL_RANK_SIZE - 1; ++workerOrdinal) {
-            CHK_RET(HcommThreadNotifyWaitOnThread(mainThread, workerOrdinal + 1, CUSTOM_TIMEOUT));
-        }
+    for (uint32_t workerOrdinal = 0; workerOrdinal < LOCAL_RANK_SIZE - 1; ++workerOrdinal) {
+        CHK_RET(HcommThreadNotifyWaitOnThread(mainThread, workerOrdinal + 1, CUSTOM_TIMEOUT));
     }
     // The second tile is the unhidden tail. Partition its output across all eight threads; within every
     // partition peers are still accumulated in ascending order, preserving each element's FP32 operation order.
@@ -293,8 +291,8 @@ HcclResult ExecLargeMessagePipelined(const OpParam &param, const AlgResourceCtx 
         const ThreadHandle worker = resCtx.threads[workerOrdinal + 2];
         const uint64_t begin = secondTileCount * partition / LOCAL_RANK_SIZE;
         const uint64_t end = secondTileCount * (partition + 1) / LOCAL_RANK_SIZE;
-        CHK_RET(HcommThreadNotifyRecordOnThread(mainThread, worker, 0));
-        CHK_RET(HcommThreadNotifyWaitOnThread(worker, 0, CUSTOM_TIMEOUT));
+        CHK_RET(HcommThreadNotifyRecordOnThread(mainThread, worker, 3));
+        CHK_RET(HcommThreadNotifyWaitOnThread(worker, 3, CUSTOM_TIMEOUT));
         for (uint32_t peer = 0; peer < LOCAL_RANK_SIZE; ++peer) {
             if (peer == resCtx.localRankIndex) {
                 continue;

@@ -162,8 +162,8 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
         // ==============================================
 
         // Thread 0 coordinates reductions, thread 1 drives the Clos link, and threads 2..8 each drive one
-        // full-mesh peer. Notify 0 remains the host/device rendezvous (and worker start gate); notify 1..7 on
-        // thread 0 are worker completion gates.
+        // full-mesh peer. Thread 0 uses notify 0 for host/device rendezvous and notify 1..7 for worker
+        // completions; each worker uses notify 0..3 as distinct phase-start gates.
         uint32_t threadNum = AICPU_THREAD_NUM;
         uint32_t notifyNumPerThread = EXPECTED_LOCAL_RANK_SIZE;
 
