@@ -19,9 +19,11 @@
 #include "launch_aicpu_kernel.h"
 
 namespace {
-constexpr uint32_t CHANNEL_NOTIFY_NUM = 2;
 constexpr uint32_t EXPECTED_RANK_SIZE = 16;
 constexpr uint32_t EXPECTED_LOCAL_RANK_SIZE = 8;
+constexpr uint32_t LARGE_MESSAGE_TILE_NUM = 4;
+constexpr uint32_t LOCAL_CHANNEL_NOTIFY_NUM = LARGE_MESSAGE_TILE_NUM * 2 - 1;
+constexpr uint32_t CROSS_CHANNEL_NOTIFY_NUM = LARGE_MESSAGE_TILE_NUM;
 // One coordinator, one dedicated Clos worker and seven full-mesh workers.
 constexpr uint32_t AICPU_THREAD_NUM = EXPECTED_LOCAL_RANK_SIZE + 1;
 
@@ -173,8 +175,8 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
         resCtxHost.aicpuThread = resCtxHost.threads[0];
         CHK_RET(HcclThreadExportToCommEngine(comm, 1, &resCtxHost.aicpuThread, cpuTsEngine, &param.aicpuThreadOnCpu));
 
-        // 每个对端仅申请一个 channel；DATA 和 READY notify 分别负责数据到达与工作区复用同步。
-        const uint32_t channelNum = param.rankSize - 1;
+        // 算法仅使用 7 个 Server 内 peer 和 1 个跨 Server partner。每个实际对端只申请一个 channel。
+        const uint32_t channelNum = EXPECTED_LOCAL_RANK_SIZE;
         if (channelNum > 0) {
             std::vector<HcclChannelDesc> channelDescs(channelNum);
             CHK_RET(HcclChannelDescInit(channelDescs.data(), channelNum));
@@ -184,6 +186,17 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
                 if (remoteRank == param.myRank) {
                     continue;
                 }
+                const bool isCrossPartner = remoteRank == resCtxHost.partnerRank;
+                bool required = isCrossPartner;
+                for (const uint32_t localRank : resCtxHost.localRanks) {
+                    if (remoteRank == localRank) {
+                        required = true;
+                        break;
+                    }
+                }
+                if (!required) {
+                    continue;
+                }
                 CommLink link;
                 CHK_RET(FindLink(comm, param.myRank, remoteRank, link));
                 HcclChannelDesc &desc = channelDescs[channelIdx];
@@ -191,11 +204,13 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
                 desc.channelProtocol = link.linkAttr.linkProtocol;
                 desc.localEndpoint = link.srcEndpointDesc;
                 desc.remoteEndpoint = link.dstEndpointDesc;
-                desc.notifyNum = CHANNEL_NOTIFY_NUM;
+                desc.notifyNum = isCrossPartner ? CROSS_CHANNEL_NOTIFY_NUM : LOCAL_CHANNEL_NOTIFY_NUM;
                 resCtxHost.channels[channelIdx].remoteRank = remoteRank;
-                resCtxHost.channels[channelIdx].notifyNum = CHANNEL_NOTIFY_NUM;
+                resCtxHost.channels[channelIdx].notifyNum = desc.notifyNum;
                 ++channelIdx;
             }
+            CHK_PRT_RET(channelIdx != channelNum,
+                HCCL_ERROR("Expected %u channels, but configured %u", channelNum, channelIdx), HCCL_E_INTERNAL);
             std::vector<ChannelHandle> handles(channelNum);
             CHK_RET(HcclChannelAcquire(comm, aicpuTsEngine, channelDescs.data(), channelNum, handles.data()));
             for (uint32_t idx = 0; idx < channelNum; ++idx) {
