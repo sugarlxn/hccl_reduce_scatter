@@ -55,6 +55,12 @@ struct CcuCrossReduceKernelArg : public CcuKernelArgBase {
     HcclReduceOp reduceOp;
 };
 
+enum class ReduceScatterAlgorithm : uint32_t {
+    DIRECT_MESH = 0,
+    STAGING_MESH = 1,
+    HIERARCHICAL = 2,
+};
+
 // ccu kernel register所需信息
 struct CcuKernelInfo {
     // kernel名称
@@ -76,6 +82,7 @@ public:
 };
 
 struct AlgResourceCtx {
+    ReduceScatterAlgorithm algorithm = ReduceScatterAlgorithm::DIRECT_MESH;
     ThreadHandle ccuThread;            ///< CCU通信引擎上的thread资源
     CommBuffer localBuffer;            ///< 本端HCCL通信内存
     std::vector<ThreadHandle> threads; ///< CCU通信引擎上的thread资源
@@ -89,6 +96,7 @@ struct AlgResourceCtx {
     std::vector<char> Serialize()
     {
         BinaryStream binaryStream;
+        binaryStream << algorithm;
         binaryStream << ccuThread;
         binaryStream << localBuffer;
         binaryStream << threads;
@@ -106,6 +114,7 @@ struct AlgResourceCtx {
     void DeSerialize(std::vector<char> &data)
     {
         BinaryStream binaryStream(data);
+        binaryStream >> algorithm;
         binaryStream >> ccuThread;
         binaryStream >> localBuffer;
         binaryStream >> threads;

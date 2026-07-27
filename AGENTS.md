@@ -125,6 +125,9 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
 ```shell
 bash build.sh
 ```
+
+**编译通过即可，仿真测试由我来手动完成**
+
 完整的Ascend 环境安装在路径: `/home/workspace`
 包括：`Ascend`、`hccl`、`hcomm`
 
