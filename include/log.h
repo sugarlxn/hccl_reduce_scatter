@@ -13,6 +13,7 @@
 
 #include <cstdio>
 #include <hccl/hccl_types.h>
+#include <ccu/ccu_types.h>
 
 #ifndef LOG_LEVEL
 #define LOG_LEVEL LOG_LEVEL_ERROR // 默认日志级别为：ERROR
@@ -25,6 +26,29 @@ typedef enum {
     LOG_LEVEL_ERROR = 3,   // ERROR级别
     LOG_LEVEL_NONE = 4     // 关闭所有日志
 } LogLevel;
+
+// CcuResult 返回码转换为 HcclResult 返回码
+inline HcclResult ConvertCcuToHccl(CcuResult ccuResult)
+{
+    switch (ccuResult) {
+        case CCU_SUCCESS:
+            return HCCL_SUCCESS;
+        case CCU_E_PARA:
+            return HCCL_E_PARA;
+        case CCU_E_PTR:
+            return HCCL_E_PTR;
+        case CCU_E_INTERNAL:
+            return HCCL_E_INTERNAL;
+        case CCU_E_NOT_SUPPORT:
+            return HCCL_E_NOT_SUPPORT;
+        case CCU_E_NOT_FOUND:
+            return HCCL_E_NOT_FOUND;
+        case CCU_E_UNAVAIL:
+            return HCCL_E_UNAVAIL;
+        default:
+            return HCCL_E_INTERNAL;
+    }
+}
 
 #ifndef LIKELY
 #define LIKELY(x) (static_cast<bool>(__builtin_expect(static_cast<bool>(x), 1)))
@@ -88,6 +112,16 @@ typedef enum {
                 HCCL_ERROR("[%s] call trace: hcclRet -> %d", __func__, hcclRet); \
             } \
             return static_cast<HcclResult>(hcclRet); \
+        } \
+    } while (0)
+
+/* 检查函数返回值, 并返回指定错误码 */
+#define CHK_RET_CCU(call) \
+    do { \
+        CcuResult ccuRet = call; \
+        if (UNLIKELY(ccuRet != CCU_SUCCESS)) { \
+            HCCL_ERROR("[%s] call trace: ccuRet -> %d", __func__, ccuRet); \
+            return ConvertCcuToHccl(ccuRet); \
         } \
     } while (0)
 

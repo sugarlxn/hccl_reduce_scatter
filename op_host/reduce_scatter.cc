@@ -11,80 +11,245 @@
 #include <hccl/hccl_res_expt.h>
 #include <hccl/hccl_rank_graph.h>
 #include <hccl/hccl_diag.h>
+#include <hccl/hccl_ccu_res.h>
+#include <ccu/ccu_launch.h>
+
+#include <algorithm>
+#include <cstring>
+#include <memory>
+#include <vector>
 
 #include "log.h"
 #include "common.h"
 #include "custom.h"
 #include "hccl.h"
-#include "launch_aicpu_kernel.h"
+#include "exec_op.h"
+#include "ccu_kernel.h"
+
+namespace ops_hccl {
+CcuResult CcuLocalReduceKernel(CcuKernelArg arg);
+CcuResult CcuCrossReduceKernel(CcuKernelArg arg);
+} // namespace ops_hccl
 
 namespace {
-constexpr uint32_t EXPECTED_RANK_SIZE = 16;
-constexpr uint32_t EXPECTED_LOCAL_RANK_SIZE = 8;
-constexpr uint32_t LARGE_MESSAGE_TILE_NUM = 4;
-constexpr uint32_t CHANNEL_NOTIFY_NUM = LARGE_MESSAGE_TILE_NUM * 2 - 1;
-// One coordinator, one dedicated Clos worker and seven full-mesh workers.
-constexpr uint32_t AICPU_THREAD_NUM = EXPECTED_LOCAL_RANK_SIZE + 1;
+constexpr uint32_t CHANNEL_NOTIFY_NUM = 1;
+constexpr uint64_t HIERARCHICAL_MIN_INPUT_BYTES = 1024 * 1024;
 
-HcclResult FindLink(HcclComm comm, uint32_t localRank, uint32_t remoteRank, CommLink &selected)
+HcclResult BuildChannelDesc(HcclComm comm, uint32_t netLayer, uint32_t myRank, uint32_t remoteRank,
+    HcclChannelDesc &desc)
 {
-    uint32_t *layers = nullptr;
-    uint32_t layerNum = 0;
-    CHK_RET(HcclRankGraphGetLayers(comm, &layers, &layerNum));
-    CHK_PRT_RET(layerNum == 0 || layers == nullptr, HCCL_ERROR("No network layer is available"), HCCL_E_INTERNAL);
-    for (uint32_t layerIdx = 0; layerIdx < layerNum; ++layerIdx) {
-        CommLink *links = nullptr;
-        uint32_t linkNum = 0;
-        HcclResult ret = HcclRankGraphGetLinks(comm, layers[layerIdx], localRank, remoteRank, &links, &linkNum);
-        if (ret != HCCL_SUCCESS || links == nullptr || linkNum == 0) {
-            continue;
+    CommLink *links = nullptr;
+    uint32_t linkNum = 0;
+    CHK_RET(HcclRankGraphGetLinks(comm, netLayer, myRank, remoteRank, &links, &linkNum));
+
+    const CommLink *selected = nullptr;
+    for (uint32_t i = 0; i < linkNum; ++i) {
+        if (links[i].linkAttr.linkProtocol == CommProtocol::COMM_PROTOCOL_UBC_CTP) {
+            selected = &links[i];
+            break;
         }
-        selected = links[0];
-        return HCCL_SUCCESS;
     }
-    HCCL_ERROR("No link from rank %u to rank %u", localRank, remoteRank);
-    return HCCL_E_INTERNAL;
-}
+    CHK_PRT_RET(selected == nullptr,
+        HCCL_ERROR("No CCU UBC_CTP link on layer %u from rank %u to rank %u", netLayer, myRank, remoteRank),
+        HCCL_E_NOT_FOUND);
 
-HcclResult CheckParam(const OpParam &param)
-{
-    CHK_PRT_RET(param.rankSize == 0, HCCL_ERROR("rankSize must be positive"), HCCL_E_PARA);
-    CHK_PRT_RET(param.dataType != HCCL_DATA_TYPE_FP32, HCCL_ERROR("Only FP32 is supported"), HCCL_E_NOT_SUPPORT);
-    CHK_PRT_RET(param.reduceType != HCCL_REDUCE_SUM, HCCL_ERROR("Only SUM is supported"), HCCL_E_NOT_SUPPORT);
-    constexpr uint64_t typeSize = sizeof(float);
-    CHK_PRT_RET(param.count > UINT64_MAX / typeSize / param.rankSize,
-        HCCL_ERROR("ReduceScatter data size overflows uint64_t"), HCCL_E_PARA);
+    CHK_RET(HcclChannelDescInit(&desc, 1));
+    desc.remoteRank = remoteRank;
+    desc.notifyNum = CHANNEL_NOTIFY_NUM;
+    desc.channelProtocol = selected->linkAttr.linkProtocol;
+    desc.localEndpoint = selected->srcEndpointDesc;
+    desc.remoteEndpoint = selected->dstEndpointDesc;
     return HCCL_SUCCESS;
 }
 
-HcclResult GetLocalTopology(HcclComm comm, const OpParam &param, AlgResourceCtx &resCtx)
+HcclResult AcquireChannelsAtLayer(HcclComm comm, const OpParam &param, uint32_t netLayer,
+    const std::vector<uint32_t> &peerRanks, std::vector<ChannelHandle> &channels)
 {
-    uint32_t *layers = nullptr;
-    uint32_t layerNum = 0;
-    CHK_RET(HcclRankGraphGetLayers(comm, &layers, &layerNum));
-    for (uint32_t layerIdx = 0; layerIdx < layerNum; ++layerIdx) {
-        uint32_t *ranks = nullptr;
-        uint32_t rankNum = 0;
-        CHK_RET(HcclRankGraphGetRanksByLayer(comm, layers[layerIdx], &ranks, &rankNum));
-        if (rankNum != EXPECTED_LOCAL_RANK_SIZE || ranks == nullptr) {
-            continue;
-        }
-        resCtx.localRanks.assign(ranks, ranks + rankNum);
-        for (uint32_t idx = 0; idx < rankNum; ++idx) {
-            if (ranks[idx] == param.myRank) {
-                resCtx.localRankIndex = idx;
-                break;
-            }
-        }
-        break;
+    std::vector<HcclChannelDesc> descs(peerRanks.size());
+    channels.resize(peerRanks.size());
+    for (uint32_t i = 0; i < peerRanks.size(); ++i) {
+        CHK_RET(BuildChannelDesc(comm, netLayer, param.myRank, peerRanks[i], descs[i]));
     }
-    CHK_PRT_RET(param.rankSize != EXPECTED_RANK_SIZE || resCtx.localRanks.size() != EXPECTED_LOCAL_RANK_SIZE ||
-            resCtx.localRankIndex == INVALID_VALUE_RANKID,
-        HCCL_ERROR("Expected a 2x8 topology, rankSize=%u, localRankSize=%zu", param.rankSize,
-            resCtx.localRanks.size()),
-        HCCL_E_NOT_SUPPORT);
-    resCtx.partnerRank = param.myRank < EXPECTED_LOCAL_RANK_SIZE ? param.myRank + EXPECTED_LOCAL_RANK_SIZE :
-                                                                   param.myRank - EXPECTED_LOCAL_RANK_SIZE;
+    if (!descs.empty()) {
+        CHK_RET(HcclChannelAcquire(comm, CommEngine::COMM_ENGINE_CCU, descs.data(),
+            static_cast<uint32_t>(descs.size()), channels.data()));
+    }
+    return HCCL_SUCCESS;
+}
+
+HcclResult AcquireMeshChannels(HcclComm comm, const OpParam &param, std::vector<ChannelHandle> &channels)
+{
+    uint32_t *netLayers = nullptr;
+    uint32_t layerNum = 0;
+    CHK_RET(HcclRankGraphGetLayers(comm, &netLayers, &layerNum));
+    CHK_PRT_RET(layerNum == 0, HCCL_ERROR("Rank graph contains no network layer"), HCCL_E_INTERNAL);
+
+    // Use the highest layer that covers the whole communicator. In all three
+    // competition topologies this is Clos, keeping every channel on one IO Die.
+    uint32_t netLayer = netLayers[0];
+    for (uint32_t i = 1; i < layerNum; ++i) {
+        netLayer = std::max(netLayer, netLayers[i]);
+    }
+
+    std::vector<uint32_t> peers;
+    for (uint32_t remoteRank = 0; remoteRank < param.rankSize; ++remoteRank) {
+        if (remoteRank != param.myRank) {
+            peers.push_back(remoteRank);
+        }
+    }
+    return AcquireChannelsAtLayer(comm, param, netLayer, peers, channels);
+}
+
+HcclResult RegisterKernel(HcclComm comm, const OpParam &param, const std::vector<ChannelHandle> &channels,
+    AlgResourceCtx &resCtx)
+{
+    CcuKernelInfo kernelInfo{};
+    const char kernelName[] = "CcuKernel";
+    (void)std::memcpy(kernelInfo.kernelFuncName, kernelName, sizeof(kernelName));
+    kernelInfo.kernelFunc = reinterpret_cast<void *>(ops_hccl::CcuKernel);
+
+    auto kernelArg = std::make_shared<CcuReduceScatterKernelArg>();
+    kernelArg->rankSize = param.rankSize;
+    kernelArg->rankId = param.myRank;
+    kernelArg->dataType = param.dataType;
+    kernelArg->reduceOp = param.reduceType;
+    kernelArg->channelCount = static_cast<uint32_t>(channels.size());
+    for (uint32_t i = 0; i < channels.size(); ++i) {
+        kernelArg->channels[i] = channels[i];
+    }
+    kernelInfo.setKernelArg(kernelArg);
+
+    CcuInsHandle insHandle = 0;
+    uint32_t insNum = 0;
+    CHK_RET(HcclCommQueryCcuIns(comm, &insHandle, &insNum));
+    CHK_PRT_RET(insNum != 1, HCCL_ERROR("Expected one CCU instruction instance, got %u", insNum), HCCL_E_INTERNAL);
+
+    resCtx.ccuKernels.resize(1);
+    CHK_RET_CCU(HcommCcuKernelRegisterStart(insHandle));
+    const void *kernelArgs[] = {kernelInfo.kernelArg};
+    constexpr uint32_t DIE_ID_AUTO = 0;
+    CHK_RET_CCU(HcommCcuKernelRegister(insHandle, DIE_ID_AUTO, kernelInfo.kernelFuncName, kernelInfo.kernelFunc,
+        kernelArgs, 1, &resCtx.ccuKernels[0]));
+    CHK_RET_CCU(HcommCcuKernelRegisterEnd(insHandle));
+    return HCCL_SUCCESS;
+}
+
+HcclResult BuildHierarchyPlan(HcclComm comm, const OpParam &param, AlgResourceCtx &resCtx)
+{
+    uint32_t *localRanks = nullptr;
+    uint32_t localRankNum = 0;
+    CHK_RET(HcclRankGraphGetRanksByLayer(comm, 0, &localRanks, &localRankNum));
+    CHK_PRT_RET(localRankNum == 0 || localRankNum > MAX_LOCAL_RANK_SIZE,
+        HCCL_ERROR("Invalid layer-0 group size %u", localRankNum), HCCL_E_NOT_SUPPORT);
+    resCtx.localRanks.assign(localRanks, localRanks + localRankNum);
+    std::sort(resCtx.localRanks.begin(), resCtx.localRanks.end());
+
+    const auto localIt = std::find(resCtx.localRanks.begin(), resCtx.localRanks.end(), param.myRank);
+    CHK_PRT_RET(localIt == resCtx.localRanks.end(), HCCL_ERROR("Local rank is absent from layer-0 group"),
+        HCCL_E_INTERNAL);
+    const uint32_t localIndex = static_cast<uint32_t>(localIt - resCtx.localRanks.begin());
+
+    std::vector<uint32_t> remoteRanks;
+    for (uint32_t rank = 0; rank < param.rankSize; ++rank) {
+        if (!std::binary_search(resCtx.localRanks.begin(), resCtx.localRanks.end(), rank)) {
+            remoteRanks.push_back(rank);
+        }
+    }
+
+    resCtx.targetRanks = {param.myRank};
+    if (param.rankSize == 16) {
+        CHK_PRT_RET(localRankNum != 8 || remoteRanks.size() != 8,
+            HCCL_ERROR("Unexpected 2x8 hierarchy"), HCCL_E_INTERNAL);
+        resCtx.targetRanks.push_back(remoteRanks[localIndex]);
+        resCtx.crossPeers.push_back(remoteRanks[localIndex]);
+        resCtx.crossSendTargetIndices.push_back(1);
+    } else if (param.rankSize == 12 && localRankNum == 8) {
+        CHK_PRT_RET(remoteRanks.size() != 4, HCCL_ERROR("Unexpected 8+4 hierarchy"), HCCL_E_INTERNAL);
+        const uint32_t remoteIndex = localIndex % 4;
+        resCtx.crossPeers.push_back(remoteRanks[remoteIndex]);
+        if (localIndex < 4) {
+            resCtx.targetRanks.push_back(remoteRanks[remoteIndex]);
+            resCtx.crossSendTargetIndices.push_back(1);
+        }
+    } else if (param.rankSize == 12 && localRankNum == 4) {
+        CHK_PRT_RET(remoteRanks.size() != 8, HCCL_ERROR("Unexpected 8+4 hierarchy"), HCCL_E_INTERNAL);
+        resCtx.targetRanks.push_back(remoteRanks[localIndex]);
+        resCtx.targetRanks.push_back(remoteRanks[localIndex + 4]);
+        resCtx.crossPeers.push_back(remoteRanks[localIndex]);
+        resCtx.crossPeers.push_back(remoteRanks[localIndex + 4]);
+        resCtx.crossSendTargetIndices = {1, 2};
+    } else {
+        HCCL_ERROR("Unsupported hierarchical topology: rankSize=%u, localSize=%u", param.rankSize, localRankNum);
+        return HCCL_E_NOT_SUPPORT;
+    }
+    return HCCL_SUCCESS;
+}
+
+HcclResult RegisterHierarchicalKernels(HcclComm comm, const OpParam &param, AlgResourceCtx &resCtx)
+{
+    std::vector<uint32_t> localPeers;
+    for (uint32_t rank : resCtx.localRanks) {
+        if (rank != param.myRank) {
+            localPeers.push_back(rank);
+        }
+    }
+    const uint32_t localIndex = static_cast<uint32_t>(
+        std::find(resCtx.localRanks.begin(), resCtx.localRanks.end(), param.myRank) - resCtx.localRanks.begin());
+
+    std::vector<ChannelHandle> localChannels;
+    std::vector<ChannelHandle> crossChannels;
+    CHK_RET(AcquireChannelsAtLayer(comm, param, 0, localPeers, localChannels));
+    CHK_RET(AcquireChannelsAtLayer(comm, param, 1, resCtx.crossPeers, crossChannels));
+
+    CcuKernelInfo localInfo{};
+    const char localName[] = "CcuLocalReduceKernel";
+    (void)std::memcpy(localInfo.kernelFuncName, localName, sizeof(localName));
+    localInfo.kernelFunc = reinterpret_cast<void *>(ops_hccl::CcuLocalReduceKernel);
+    auto localArg = std::make_shared<CcuLocalReduceKernelArg>();
+    localArg->groupSize = static_cast<uint32_t>(resCtx.localRanks.size());
+    localArg->groupRankId = localIndex;
+    localArg->targetCount = static_cast<uint32_t>(resCtx.targetRanks.size());
+    localArg->dataType = param.dataType;
+    localArg->reduceOp = param.reduceType;
+    localArg->channelCount = static_cast<uint32_t>(localChannels.size());
+    for (uint32_t i = 0; i < localChannels.size(); ++i) {
+        localArg->channels[i] = localChannels[i];
+    }
+    localInfo.setKernelArg(localArg);
+
+    CcuKernelInfo crossInfo{};
+    const char crossName[] = "CcuCrossReduceKernel";
+    (void)std::memcpy(crossInfo.kernelFuncName, crossName, sizeof(crossName));
+    crossInfo.kernelFunc = reinterpret_cast<void *>(ops_hccl::CcuCrossReduceKernel);
+    auto crossArg = std::make_shared<CcuCrossReduceKernelArg>();
+    crossArg->dataType = param.dataType;
+    crossArg->reduceOp = param.reduceType;
+    crossArg->channelCount = static_cast<uint32_t>(crossChannels.size());
+    crossArg->sendCount = static_cast<uint32_t>(resCtx.crossSendTargetIndices.size());
+    for (uint32_t i = 0; i < crossChannels.size(); ++i) {
+        crossArg->channels[i] = crossChannels[i];
+    }
+    for (uint32_t sendIdx = 0; sendIdx < crossArg->sendCount; ++sendIdx) {
+        const uint32_t targetRank = resCtx.targetRanks[resCtx.crossSendTargetIndices[sendIdx]];
+        const auto peerIt = std::find(resCtx.crossPeers.begin(), resCtx.crossPeers.end(), targetRank);
+        CHK_PRT_RET(peerIt == resCtx.crossPeers.end(), HCCL_ERROR("Cross target has no channel"), HCCL_E_INTERNAL);
+        crossArg->sendChannelIndices[sendIdx] = static_cast<uint32_t>(peerIt - resCtx.crossPeers.begin());
+    }
+    crossInfo.setKernelArg(crossArg);
+
+    CcuInsHandle insHandle = 0;
+    uint32_t insNum = 0;
+    CHK_RET(HcclCommQueryCcuIns(comm, &insHandle, &insNum));
+    CHK_PRT_RET(insNum != 1, HCCL_ERROR("Expected one CCU instruction instance, got %u", insNum), HCCL_E_INTERNAL);
+    resCtx.ccuKernels.resize(2);
+    CHK_RET_CCU(HcommCcuKernelRegisterStart(insHandle));
+    const void *localArgs[] = {localInfo.kernelArg};
+    const void *crossArgs[] = {crossInfo.kernelArg};
+    CHK_RET_CCU(HcommCcuKernelRegister(insHandle, 0, localInfo.kernelFuncName, localInfo.kernelFunc, localArgs, 1,
+        &resCtx.ccuKernels[0]));
+    CHK_RET_CCU(HcommCcuKernelRegister(insHandle, 0, crossInfo.kernelFuncName, crossInfo.kernelFunc, crossArgs, 1,
+        &resCtx.ccuKernels[1]));
+    CHK_RET_CCU(HcommCcuKernelRegisterEnd(insHandle));
     return HCCL_SUCCESS;
 }
 } // namespace
@@ -99,13 +264,13 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
 
     // 构造算子参数
     OpParam param;
-    sprintf(param.tag, "%s", "hccl_custom_reduce_scatter");
+    sprintf(param.tag, "%s", "hccl_custom_reducescatter");
     param.inputPtr = sendBuf;
     param.outputPtr = recvBuf;
     param.count = recvCount;
     param.dataType = dataType;
-    param.reduceType = op;
     param.opType = HcclCMDType::HCCL_CMD_REDUCE_SCATTER;
+    param.reduceType = op;
 
     // 注册算子信息
     HcclDfxOpInfo dfxInfo;
@@ -118,35 +283,32 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
     // ==============================================
     CHK_RET(HcclGetRankId(comm, &param.myRank));
     CHK_RET(HcclGetRankSize(comm, &param.rankSize));
-    CHK_RET(CheckParam(param));
+    CHK_PRT_RET(param.rankSize == 0 || param.rankSize > MAX_RANK_SIZE,
+        HCCL_ERROR("Unsupported rank size %u", param.rankSize), HCCL_E_NOT_SUPPORT);
+    CHK_PRT_RET(dataType != HCCL_DATA_TYPE_FP32, HCCL_ERROR("Only float32 is supported"), HCCL_E_NOT_SUPPORT);
+    CHK_PRT_RET(op != HCCL_REDUCE_SUM, HCCL_ERROR("Only sum reduction is supported"), HCCL_E_NOT_SUPPORT);
+    const bool useHierarchy = param.rankSize > 4 && recvCount * sizeof(float) * param.rankSize >
+        HIERARCHICAL_MIN_INPUT_BYTES;
+    (void)snprintf(param.tag, sizeof(param.tag), "hccl_custom_reducescatter_%s", useHierarchy ? "hier" : "mesh");
 
     // ==============================================
     // STEP 2: 创建资源
     // ==============================================
-    CommEngine aicpuTsEngine = CommEngine::COMM_ENGINE_AICPU_TS;
-    CommEngine cpuTsEngine = CommEngine::COMM_ENGINE_CPU_TS;
+    CommEngine ccuEngine = CommEngine::COMM_ENGINE_CCU;
 
     // ==============================================
     // STEP 2.1: 申请用于 Host/Device 同步的通信资源
     // ==============================================
-    // 将用户传入的 stream 转换为 thread，并申请 Notify；同时导出为 AICPU 上可用的 thread
-    CHK_RET(HcclThreadAcquireWithStream(comm, cpuTsEngine, stream, 1, &param.cpuThread));
-    CHK_RET(HcclThreadExportToCommEngine(comm, 1, &param.cpuThread, aicpuTsEngine, &param.cpuThreadOnAicpu));
+    // 将用户传入的 stream 转换为 CCU 通信引擎中的 thread，并申请 1 个 notify
+    CHK_RET(HcclThreadAcquireWithStream(comm, ccuEngine, stream, 1, &param.cpuThread));
 
     void *ctx = nullptr;
     uint64_t size = 0;
-    if (HcclEngineCtxGet(comm, param.tag, aicpuTsEngine, &ctx, &size) == HCCL_SUCCESS) {
-        // AICPU 资源已经存在，复用资源
+    if (HcclEngineCtxGet(comm, param.tag, ccuEngine, &ctx, &size) == HCCL_SUCCESS) {
+        // CCU 资源已经存在，复用资源
         HCCL_INFO("Engine context already exists");
         param.resCtx = ctx;
         param.ctxSize = size;
-
-        // Host 资源已经存在，复用资源
-        void *hostCtx = nullptr;
-        uint64_t hostCtxSize = 0;
-        CHK_RET(HcclEngineCtxGet(comm, param.tag, cpuTsEngine, &hostCtx, &hostCtxSize));
-        ThreadHandle *aicpuThread = static_cast<ThreadHandle *>(hostCtx);
-        CHK_RET(HcclThreadExportToCommEngine(comm, 1, aicpuThread, cpuTsEngine, &param.aicpuThreadOnCpu));
     } else {
         // Device 资源不存在，资源构建
         AlgResourceCtx resCtxHost;
@@ -156,81 +318,41 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
         uint64_t cclBufferSize;
         CHK_RET(HcclGetHcclBuffer(comm, &cclBufferAddr, &cclBufferSize));
         resCtxHost.localBuffer = CommBuffer{cclBufferAddr, cclBufferSize};
-        CHK_RET(GetLocalTopology(comm, param, resCtxHost));
 
         // ==============================================
-        // STEP 2.2: 申请资源Thread和Channel
+        // STEP 2.2: 申请资源：Thread、Channel、CCU Kernel
         // ==============================================
 
-        // Thread 0 coordinates reductions, thread 1 drives the Clos link, and threads 2..8 each drive one
-        // full-mesh peer. Thread 0 uses notify 0 for host/device rendezvous and notify 1..7 for worker
-        // completions; each worker uses notify 0..3 as distinct phase-start gates.
-        uint32_t threadNum = AICPU_THREAD_NUM;
-        uint32_t notifyNumPerThread = EXPECTED_LOCAL_RANK_SIZE;
-
+        uint32_t threadNum = 1;
         resCtxHost.threads.resize(threadNum);
-        CHK_RET(HcclThreadAcquire(comm, aicpuTsEngine, threadNum, notifyNumPerThread, resCtxHost.threads.data()));
-        // 将 threads[0] 导出为 CPU 上可用的 thread，用于 Host 与 Device 同步
-        resCtxHost.aicpuThread = resCtxHost.threads[0];
-        CHK_RET(HcclThreadExportToCommEngine(comm, 1, &resCtxHost.aicpuThread, cpuTsEngine, &param.aicpuThreadOnCpu));
+        resCtxHost.threads[0] = param.cpuThread;
+        resCtxHost.ccuThread = param.cpuThread;
 
-        // Channel 初始化要求通信域内提供完整、对称的 peer 集合；每个对端仍只申请一个 channel。
-        const uint32_t channelNum = param.rankSize - 1;
-        if (channelNum > 0) {
-            std::vector<HcclChannelDesc> channelDescs(channelNum);
-            CHK_RET(HcclChannelDescInit(channelDescs.data(), channelNum));
-            resCtxHost.channels.resize(channelNum);
-            uint32_t channelIdx = 0;
-            for (uint32_t remoteRank = 0; remoteRank < param.rankSize; ++remoteRank) {
-                if (remoteRank == param.myRank) {
-                    continue;
-                }
-                CommLink link;
-                CHK_RET(FindLink(comm, param.myRank, remoteRank, link));
-                HcclChannelDesc &desc = channelDescs[channelIdx];
-                desc.remoteRank = remoteRank;
-                desc.channelProtocol = link.linkAttr.linkProtocol;
-                desc.localEndpoint = link.srcEndpointDesc;
-                desc.remoteEndpoint = link.dstEndpointDesc;
-                desc.notifyNum = CHANNEL_NOTIFY_NUM;
-                resCtxHost.channels[channelIdx].remoteRank = remoteRank;
-                resCtxHost.channels[channelIdx].notifyNum = desc.notifyNum;
-                ++channelIdx;
-            }
-            std::vector<ChannelHandle> handles(channelNum);
-            CHK_RET(HcclChannelAcquire(comm, aicpuTsEngine, channelDescs.data(), channelNum, handles.data()));
-            for (uint32_t idx = 0; idx < channelNum; ++idx) {
-                void *remoteBuffer = nullptr;
-                uint64_t remoteBufferSize = 0;
-                CHK_RET(HcclChannelGetHcclBuffer(comm, handles[idx], &remoteBuffer, &remoteBufferSize));
-                CHK_PRT_RET(remoteBuffer == nullptr || remoteBufferSize == 0,
-                    HCCL_ERROR("Invalid remote HCCL buffer for rank %u", resCtxHost.channels[idx].remoteRank),
-                    HCCL_E_INTERNAL);
-                resCtxHost.channels[idx].handle = handles[idx];
-                resCtxHost.channels[idx].remoteCclMem = CommBuffer{remoteBuffer, remoteBufferSize};
+        if (param.rankSize > 1) {
+            if (!useHierarchy) {
+                std::vector<ChannelHandle> channels;
+                CHK_RET(AcquireMeshChannels(comm, param, channels));
+                CHK_RET(RegisterKernel(comm, param, channels, resCtxHost));
+            } else {
+                CHK_RET(BuildHierarchyPlan(comm, param, resCtxHost));
+                CHK_RET(RegisterHierarchicalKernels(comm, param, resCtxHost));
             }
         }
 
         // ==============================================
         // STEP 2.3: 申请通信引擎上下文
         // ==============================================
-        // 申请 AICPU 通信引擎上下文，存放 AlgResourceCtx 信息
+        // 申请 CCU 通信引擎上下文，存放 AlgResourceCtx 信息
         std::vector<char> seq = resCtxHost.Serialize();
         uint64_t seqSize = seq.size();
         param.ctxSize = seqSize;
-        CHK_RET(HcclEngineCtxCreate(comm, param.tag, aicpuTsEngine, param.ctxSize, &param.resCtx));
-        CHK_RET(HcclEngineCtxCopy(comm, aicpuTsEngine, param.tag, seq.data(), seqSize, 0));
-        // 申请 CPU 通信引擎上下文，存放 aicpuThread 句柄
-        void *hostCtx = nullptr;
-        uint64_t hostCtxSize = sizeof(ThreadHandle);
-        const void *aicpuThreadPtr = static_cast<const void *>(&resCtxHost.aicpuThread);
-        CHK_RET(HcclEngineCtxCreate(comm, param.tag, cpuTsEngine, hostCtxSize, &hostCtx));
-        CHK_RET(HcclEngineCtxCopy(comm, cpuTsEngine, param.tag, aicpuThreadPtr, hostCtxSize, 0));
+        CHK_RET(HcclEngineCtxCreate(comm, param.tag, ccuEngine, param.ctxSize, &param.resCtx));
+        CHK_RET(HcclEngineCtxCopy(comm, ccuEngine, param.tag, seq.data(), seqSize, 0));
     }
 
     // ==============================================
-    // STEP 3: 下发 AICPU Kernel
+    // STEP 3: 下发 CCU Kernel
     // ==============================================
-    CHK_RET(ops_hccl::LaunchAICPUKernel(param, stream));
+    CHK_RET(ops_hccl::ExecOp(param));
     return HCCL_SUCCESS;
 }

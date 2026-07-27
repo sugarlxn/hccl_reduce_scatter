@@ -12,9 +12,14 @@
 #define OPS_HCCL_COMMON_H
 
 #include <unordered_map>
+
 #include <hccl/hccl_types.h>
 #include <hccl/hccl_res.h>
 #include <hccl/hcomm_primitives.h>
+#include <ccu/ccu_types.h>
+#include <ccu/ccu_variable.hpp>
+#include <ccu/ccu_event.hpp>
+#include <ccu/ccu_primitives.hpp>
 #include <acl/acl_rt.h>
 
 constexpr uint32_t NOTIFY_IDX_ACK = 0;
@@ -25,6 +30,8 @@ constexpr uint32_t COMM_INDENTIFIER_MAX_LENGTH = 128;
 constexpr uint32_t OP_NAME_LENGTH = 32;
 constexpr uint32_t TAG_LENGTH = OP_NAME_LENGTH + COMM_INDENTIFIER_MAX_LENGTH;
 constexpr uint32_t INVALID_VALUE_RANKID = 0xFFFFFFFF;
+constexpr uint32_t MAX_DATA_SIZE = 256 * 1024 * 1024; // 单次通信的最大数据量，256MB
+constexpr uint64_t MAX_RANK_SIZE = 16;
 
 struct OpParam {
     char tag[TAG_LENGTH];
@@ -38,9 +45,7 @@ struct OpParam {
     HcclCMDType opType = HcclCMDType::HCCL_CMD_INVALID;
     HcclReduceOp reduceType = HcclReduceOp::HCCL_REDUCE_SUM;
     ThreadHandle cpuThread;
-    ThreadHandle cpuThreadOnAicpu;
-    ThreadHandle aicpuThreadOnCpu; ///< AICPU_TS通信引擎上的thread资源
-    void *resCtx = nullptr;        ///< 通信引擎上下文中的资源信息，存放 custom.h 中 AlgResourceCtx 序列化后的内容
+    void *resCtx = nullptr; ///< 通信引擎上下文中的资源信息，存放 AlgResourceCtx 序列化后的内容
     uint64_t ctxSize = 0;
 };
 

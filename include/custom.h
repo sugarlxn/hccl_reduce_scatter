@@ -11,6 +11,7 @@
 #ifndef OPS_HCCL_CUSTOM_H
 #define OPS_HCCL_CUSTOM_H
 
+#include <memory>
 #include <hccl/hccl_types.h>
 #include <hccl/hccl_res.h>
 
@@ -22,34 +23,80 @@ typedef struct {
     uint64_t size;
 } CommBuffer;
 
-struct ChannelInfo {
-    uint32_t remoteRank = INVALID_VALUE_RANKID;
-    uint32_t notifyNum = 0;
-    ChannelHandle handle = 0;
-    CommBuffer remoteCclMem;
+struct CcuKernelArgBase {
+    ChannelHandle channels[MAX_RANK_SIZE];
+    uint32_t channelCount;
+};
+
+// channels are ordered by increasing remote rank, with the local rank skipped.
+struct CcuReduceScatterKernelArg : public CcuKernelArgBase {
+    uint32_t rankSize;
+    uint32_t rankId;
+    HcclDataType dataType;
+    HcclReduceOp reduceOp;
+};
+
+constexpr uint32_t MAX_LOCAL_RANK_SIZE = 8;
+constexpr uint32_t MAX_HIERARCHICAL_TARGETS = 3;
+constexpr uint32_t MAX_CROSS_PEERS = 2;
+
+struct CcuLocalReduceKernelArg : public CcuKernelArgBase {
+    uint32_t groupSize;
+    uint32_t groupRankId;
+    uint32_t targetCount;
+    HcclDataType dataType;
+    HcclReduceOp reduceOp;
+};
+
+struct CcuCrossReduceKernelArg : public CcuKernelArgBase {
+    uint32_t sendCount;
+    uint32_t sendChannelIndices[MAX_CROSS_PEERS];
+    HcclDataType dataType;
+    HcclReduceOp reduceOp;
+};
+
+// ccu kernel register所需信息
+struct CcuKernelInfo {
+    // kernel名称
+    char kernelFuncName[64];
+    // kernel函数
+    void *kernelFunc;
+    // KernelArg实例指针
+    void *kernelArg;
+
+private:
+    std::shared_ptr<CcuKernelArgBase> kernelArgSmartPtr;
+
+public:
+    template <typename T> void setKernelArg(std::shared_ptr<T> arg)
+    {
+        kernelArgSmartPtr = std::static_pointer_cast<CcuKernelArgBase>(arg);
+        kernelArg = static_cast<void *>(arg.get());
+    }
 };
 
 struct AlgResourceCtx {
-    ThreadHandle aicpuThread;          ///< AICPU_TS通信引擎上的thread资源
+    ThreadHandle ccuThread;            ///< CCU通信引擎上的thread资源
     CommBuffer localBuffer;            ///< 本端HCCL通信内存
-    uint32_t localRankIndex = INVALID_VALUE_RANKID;
-    uint32_t partnerRank = INVALID_VALUE_RANKID;
+    std::vector<ThreadHandle> threads; ///< CCU通信引擎上的thread资源
+    std::vector<CcuKernelHandle> ccuKernels;
     std::vector<uint32_t> localRanks;
-    std::vector<ThreadHandle> threads; ///< AICPU_TS通信引擎上的thread资源
-    // channels 按 remoteRank 升序保存（不包含本 rank），同时作为数据面的确定性顺序。
-    std::vector<ChannelInfo> channels;  ///< AICPU_TS通信引擎上的channel资源
+    std::vector<uint32_t> targetRanks;
+    std::vector<uint32_t> crossPeers;
+    std::vector<uint32_t> crossSendTargetIndices;
 
     // 序列化
     std::vector<char> Serialize()
     {
         BinaryStream binaryStream;
-        binaryStream << aicpuThread;
+        binaryStream << ccuThread;
         binaryStream << localBuffer;
-        binaryStream << localRankIndex;
-        binaryStream << partnerRank;
-        binaryStream << localRanks;
         binaryStream << threads;
-        binaryStream << channels;
+        binaryStream << ccuKernels;
+        binaryStream << localRanks;
+        binaryStream << targetRanks;
+        binaryStream << crossPeers;
+        binaryStream << crossSendTargetIndices;
         std::vector<char> result;
         binaryStream.Dump(result);
         return result;
@@ -59,13 +106,14 @@ struct AlgResourceCtx {
     void DeSerialize(std::vector<char> &data)
     {
         BinaryStream binaryStream(data);
-        binaryStream >> aicpuThread;
+        binaryStream >> ccuThread;
         binaryStream >> localBuffer;
-        binaryStream >> localRankIndex;
-        binaryStream >> partnerRank;
-        binaryStream >> localRanks;
         binaryStream >> threads;
-        binaryStream >> channels;
+        binaryStream >> ccuKernels;
+        binaryStream >> localRanks;
+        binaryStream >> targetRanks;
+        binaryStream >> crossPeers;
+        binaryStream >> crossSendTargetIndices;
     }
 };
 

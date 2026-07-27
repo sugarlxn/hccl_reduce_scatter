@@ -14,8 +14,8 @@
 add_library(hccl SHARED)
 
 target_sources(hccl PRIVATE
-     ${CMAKE_CURRENT_SOURCE_DIR}/reduce_scatter.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/launch_aicpu_kernel.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/reduce_scatter.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/exec_op.cc
 )
 
 target_include_directories(hccl PRIVATE
@@ -23,9 +23,13 @@ target_include_directories(hccl PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../include
     # CANN Toolkit头文件
     ${ASCEND_CANN_PACKAGE_PATH}/include
+    ${ASCEND_CANN_PACKAGE_PATH}/include/hccl
     ${ASCEND_CANN_PACKAGE_PATH}/include/hcomm
+    ${ASCEND_CANN_PACKAGE_PATH}/include/hcomm/ccu
     ${ASCEND_CANN_PACKAGE_PATH}/pkg_inc
     ${ASCEND_CANN_PACKAGE_PATH}/pkg_inc/hccl
+    ${ASCEND_CANN_PACKAGE_PATH}/pkg_inc/hcomm
+    ${ASCEND_CANN_PACKAGE_PATH}/pkg_inc/hcomm/ccu
 )
 
 target_compile_options(hccl PRIVATE
