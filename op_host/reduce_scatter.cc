@@ -34,6 +34,7 @@ CcuResult CcuCrossReduceKernel(CcuKernelArg arg);
 namespace {
 constexpr uint32_t CHANNEL_NOTIFY_NUM = 1;
 constexpr uint64_t HIERARCHICAL_MIN_INPUT_BYTES = 1024 * 1024;
+constexpr uint64_t TWO_SERVER_HIERARCHICAL_MIN_INPUT_BYTES = 512 * 1024;
 
 HcclResult BuildChannelDesc(HcclComm comm, uint32_t netLayer, uint32_t myRank, uint32_t remoteRank,
     HcclChannelDesc &desc)
@@ -287,8 +288,10 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
         HCCL_ERROR("Unsupported rank size %u", param.rankSize), HCCL_E_NOT_SUPPORT);
     CHK_PRT_RET(dataType != HCCL_DATA_TYPE_FP32, HCCL_ERROR("Only float32 is supported"), HCCL_E_NOT_SUPPORT);
     CHK_PRT_RET(op != HCCL_REDUCE_SUM, HCCL_ERROR("Only sum reduction is supported"), HCCL_E_NOT_SUPPORT);
-    const bool useHierarchy = param.rankSize > 4 && recvCount * sizeof(float) * param.rankSize >
-        HIERARCHICAL_MIN_INPUT_BYTES;
+    const uint64_t inputBytes = recvCount * sizeof(float) * param.rankSize;
+    const bool useHierarchy = param.rankSize > 4 &&
+        (inputBytes > HIERARCHICAL_MIN_INPUT_BYTES ||
+            (param.rankSize == 16 && inputBytes >= TWO_SERVER_HIERARCHICAL_MIN_INPUT_BYTES));
     (void)snprintf(param.tag, sizeof(param.tag), "hccl_custom_reducescatter_%s", useHierarchy ? "hier" : "mesh");
 
     // ==============================================
