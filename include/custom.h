@@ -36,6 +36,25 @@ struct CcuReduceScatterKernelArg : public CcuKernelArgBase {
     HcclReduceOp reduceOp;
 };
 
+constexpr uint32_t MAX_LOCAL_RANK_SIZE = 8;
+constexpr uint32_t MAX_HIERARCHICAL_TARGETS = 3;
+constexpr uint32_t MAX_CROSS_PEERS = 2;
+
+struct CcuLocalReduceKernelArg : public CcuKernelArgBase {
+    uint32_t groupSize;
+    uint32_t groupRankId;
+    uint32_t targetCount;
+    HcclDataType dataType;
+    HcclReduceOp reduceOp;
+};
+
+struct CcuCrossReduceKernelArg : public CcuKernelArgBase {
+    uint32_t sendCount;
+    uint32_t sendChannelIndices[MAX_CROSS_PEERS];
+    HcclDataType dataType;
+    HcclReduceOp reduceOp;
+};
+
 // ccu kernel register所需信息
 struct CcuKernelInfo {
     // kernel名称
@@ -61,6 +80,10 @@ struct AlgResourceCtx {
     CommBuffer localBuffer;            ///< 本端HCCL通信内存
     std::vector<ThreadHandle> threads; ///< CCU通信引擎上的thread资源
     std::vector<CcuKernelHandle> ccuKernels;
+    std::vector<uint32_t> localRanks;
+    std::vector<uint32_t> targetRanks;
+    std::vector<uint32_t> crossPeers;
+    std::vector<uint32_t> crossSendTargetIndices;
 
     // 序列化
     std::vector<char> Serialize()
@@ -70,6 +93,10 @@ struct AlgResourceCtx {
         binaryStream << localBuffer;
         binaryStream << threads;
         binaryStream << ccuKernels;
+        binaryStream << localRanks;
+        binaryStream << targetRanks;
+        binaryStream << crossPeers;
+        binaryStream << crossSendTargetIndices;
         std::vector<char> result;
         binaryStream.Dump(result);
         return result;
@@ -83,6 +110,10 @@ struct AlgResourceCtx {
         binaryStream >> localBuffer;
         binaryStream >> threads;
         binaryStream >> ccuKernels;
+        binaryStream >> localRanks;
+        binaryStream >> targetRanks;
+        binaryStream >> crossPeers;
+        binaryStream >> crossSendTargetIndices;
     }
 };
 
