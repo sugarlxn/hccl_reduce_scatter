@@ -91,24 +91,36 @@ HcclResult ExecOp(const OpParam &param)
         return HCCL_SUCCESS;
     }
 
-    CHK_PRT_RET(resCtx.algorithm != ReduceScatterAlgorithm::HIERARCHICAL || resCtx.ccuKernels.size() != 2 ||
-            resCtx.localRanks.empty() || resCtx.targetRanks.empty(),
+    const bool hierarchicalStaging = resCtx.algorithm == ReduceScatterAlgorithm::HIERARCHICAL_STAGING;
+    CHK_PRT_RET((resCtx.algorithm != ReduceScatterAlgorithm::HIERARCHICAL && !hierarchicalStaging) ||
+            resCtx.ccuKernels.size() != 2 || resCtx.localRanks.empty() || resCtx.targetRanks.empty(),
         HCCL_ERROR("Incomplete hierarchical resources"), HCCL_E_INTERNAL);
+    const uint32_t localSize = static_cast<uint32_t>(resCtx.localRanks.size());
     const uint32_t targetCount = static_cast<uint32_t>(resCtx.targetRanks.size());
-    const uint64_t partialSlotCount = std::max<uint64_t>(targetCount - 1, 1);
-    uint64_t slotStride = std::min<uint64_t>(MAX_DATA_SIZE, resCtx.localBuffer.size / partialSlotCount);
+    const uint64_t stagingSlotCount = hierarchicalStaging ? localSize : 0;
+    const uint64_t totalSlotCount = stagingSlotCount + std::max<uint64_t>(targetCount - 1, 1);
+    uint64_t slotStride = std::min<uint64_t>(MAX_DATA_SIZE, resCtx.localBuffer.size / totalSlotCount);
     slotStride = (slotStride / dataTypeSize) * dataTypeSize;
     CHK_PRT_RET(slotStride == 0, HCCL_ERROR("CCL buffer is too small"), HCCL_E_INTERNAL);
 
     for (uint64_t chunkOffset = 0; chunkOffset < recvBytes; chunkOffset += slotStride) {
         const uint64_t chunkBytes = std::min(slotStride, recvBytes - chunkOffset);
-        std::vector<uint64_t> localArgs = {inputAddr, inputToken, chunkBytes};
+        std::vector<uint64_t> localArgs = {inputAddr, inputToken};
+        if (hierarchicalStaging) {
+            localArgs.push_back(cclToken);
+        }
+        localArgs.push_back(chunkBytes);
         for (uint32_t targetRank : resCtx.targetRanks) {
             localArgs.push_back(targetRank * recvBytes + chunkOffset);
         }
+        if (hierarchicalStaging) {
+            for (uint32_t sourceIdx = 0; sourceIdx < localSize; ++sourceIdx) {
+                localArgs.push_back(cclAddr + sourceIdx * slotStride);
+            }
+        }
         localArgs.push_back(outputAddr + chunkOffset);
         for (uint32_t targetIdx = 1; targetIdx < targetCount; ++targetIdx) {
-            localArgs.push_back(cclAddr + (targetIdx - 1) * slotStride);
+            localArgs.push_back(cclAddr + (stagingSlotCount + targetIdx - 1) * slotStride);
         }
         localArgs.push_back(outputToken);
         for (uint32_t targetIdx = 1; targetIdx < targetCount; ++targetIdx) {
@@ -119,7 +131,7 @@ HcclResult ExecOp(const OpParam &param)
 
         std::vector<uint64_t> crossArgs = {outputAddr + chunkOffset, outputToken, cclToken, chunkBytes};
         for (uint32_t targetIdx : resCtx.crossSendTargetIndices) {
-            crossArgs.push_back(cclAddr + (targetIdx - 1) * slotStride);
+            crossArgs.push_back(cclAddr + (stagingSlotCount + targetIdx - 1) * slotStride);
         }
         CHK_RET_CCU(HcommCcuKernelLaunch(resCtx.threads[0], resCtx.ccuKernels[1], crossArgs.data(),
             static_cast<uint32_t>(crossArgs.size())));

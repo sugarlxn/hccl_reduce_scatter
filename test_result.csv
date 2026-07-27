@@ -2,3 +2,4 @@
 1,BenchMark,2026/07/27 13:41:43,214.84,pass,pass,pass,pass,pass,pass,pass,pass,pass,22.00μs,1.77ms,1.35ms,18.00μs,2.50ms,1.96ms,42.00μs,2.22ms,1.73ms
 8,ccu-v1.1,2026/07/27 16:49:29,192.10,pass,pass,pass,pass,pass,pass,pass,pass,pass,50.00μs,1.88ms,1.49ms,23.00μs,2.56ms,1.97ms,42.00μs,3.53ms,2.75ms
 12,ccu-v2.0,2026/07/27 19:47:29,175.31,pass,pass,pass,pass,pass,pass,pass,pass,pass,65.00μs,4.90ms,3.82ms,18.00μs,3.12ms,2.34ms,51.00μs,4.55ms,4.24ms
+11,ccu-v2.1,2026/07/27 21:53:32,177.61,pass,pass,pass,pass,pass,pass,pass,pass,pass,37.00μs,5.80ms,4.54ms,18.00μs,2.52ms,1.96ms,42.00μs,7.93ms,6.20ms

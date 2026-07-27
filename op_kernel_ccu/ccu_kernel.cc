@@ -250,16 +250,24 @@ CcuResult CcuLocalReduceKernel(CcuKernelArg arg)
 
     ccu::Variable inputAddr;
     ccu::Variable inputToken;
+    ccu::Variable cclToken;
     ccu::Variable chunkBytes;
     std::vector<ccu::Variable> targetOffsets(kernelArg->targetCount);
+    std::vector<ccu::Variable> stageAddrs(kernelArg->useStaging ? kernelArg->groupSize : 0);
     std::vector<ccu::Variable> dstAddrs(kernelArg->targetCount);
     std::vector<ccu::Variable> dstTokens(kernelArg->targetCount);
     uint32_t argId = 0;
     CCU_RETURN_IF_ERROR(ccu::LoadArg(inputAddr, argId++));
     CCU_RETURN_IF_ERROR(ccu::LoadArg(inputToken, argId++));
+    if (kernelArg->useStaging) {
+        CCU_RETURN_IF_ERROR(ccu::LoadArg(cclToken, argId++));
+    }
     CCU_RETURN_IF_ERROR(ccu::LoadArg(chunkBytes, argId++));
     for (uint32_t target = 0; target < kernelArg->targetCount; ++target) {
         CCU_RETURN_IF_ERROR(ccu::LoadArg(targetOffsets[target], argId++));
+    }
+    for (uint32_t source = 0; source < stageAddrs.size(); ++source) {
+        CCU_RETURN_IF_ERROR(ccu::LoadArg(stageAddrs[source], argId++));
     }
     for (uint32_t target = 0; target < kernelArg->targetCount; ++target) {
         CCU_RETURN_IF_ERROR(ccu::LoadArg(dstAddrs[target], argId++));
@@ -290,6 +298,56 @@ CcuResult CcuLocalReduceKernel(CcuKernelArg arg)
     for (uint32_t i = 0; i < kernelArg->channelCount; ++i) {
         CCU_RETURN_IF_ERROR(ccu::NotifyWait(kernelArg->channels[i], CHANNEL_NOTIFY_INDEX,
             static_cast<uint16_t>(INPUT_ADDR_READY | INPUT_TOKEN_READY)));
+    }
+
+    if (kernelArg->useStaging) {
+        // All local Mesh links fetch one target in parallel. The staging slots
+        // are reduced in rank order, then reused for the next target. This
+        // keeps deterministic FP32 order while fitting every large case in a
+        // single launch (8+1 slots for 2x8, 4+2 on the short side of 8+4).
+        ccu::Event transferEvent;
+        ccu::Event reduceEvent;
+        const uint16_t groupMask = static_cast<uint16_t>((1U << kernelArg->groupSize) - 1U);
+        for (uint32_t target = 0; target < kernelArg->targetCount; ++target) {
+            for (uint32_t source = 0; source < kernelArg->groupSize; ++source) {
+                ccu::LocalAddr stage;
+                stage.addr = stageAddrs[source];
+                stage.token = cclToken;
+                const uint16_t mask = static_cast<uint16_t>(1U << source);
+                if (source == kernelArg->groupRankId) {
+                    ccu::LocalAddr src;
+                    src.addr = inputAddr;
+                    src.addr += targetOffsets[target];
+                    src.token = inputToken;
+                    CCU_RETURN_IF_ERROR(ccu::LocalCopy(stage, src, chunkBytes, transferEvent, mask));
+                } else {
+                    const uint32_t sourceChannel = source < kernelArg->groupRankId ? source : source - 1;
+                    ccu::RemoteAddr src;
+                    src.addr = remoteInputAddr[source];
+                    src.addr += targetOffsets[target];
+                    src.token = remoteInputToken[source];
+                    CCU_RETURN_IF_ERROR(
+                        ccu::Read(kernelArg->channels[sourceChannel], stage, src, chunkBytes, transferEvent, mask));
+                }
+            }
+            CCU_RETURN_IF_ERROR(ccu::EventWait(transferEvent, groupMask));
+
+            ccu::LocalAddr dst;
+            dst.addr = dstAddrs[target];
+            dst.token = dstTokens[target];
+            ccu::LocalAddr staged;
+            staged.addr = stageAddrs[0];
+            staged.token = cclToken;
+            CCU_RETURN_IF_ERROR(ccu::LocalCopy(dst, staged, chunkBytes, reduceEvent));
+            CCU_RETURN_IF_ERROR(ccu::EventWait(reduceEvent));
+            for (uint32_t source = 1; source < kernelArg->groupSize; ++source) {
+                staged.addr = stageAddrs[source];
+                CCU_RETURN_IF_ERROR(
+                    ccu::LocalReduce(dst, staged, chunkBytes, kernelArg->dataType, kernelArg->reduceOp, reduceEvent));
+                CCU_RETURN_IF_ERROR(ccu::EventWait(reduceEvent));
+            }
+        }
+        return CCU_SUCCESS;
     }
 
     // Give each independent target a different cyclic source order. Each

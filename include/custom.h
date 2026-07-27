@@ -44,6 +44,7 @@ struct CcuLocalReduceKernelArg : public CcuKernelArgBase {
     uint32_t groupSize;
     uint32_t groupRankId;
     uint32_t targetCount;
+    bool useStaging;
     HcclDataType dataType;
     HcclReduceOp reduceOp;
 };
@@ -59,6 +60,7 @@ enum class ReduceScatterAlgorithm : uint32_t {
     DIRECT_MESH = 0,
     STAGING_MESH = 1,
     HIERARCHICAL = 2,
+    HIERARCHICAL_STAGING = 3,
 };
 
 // ccu kernel register所需信息

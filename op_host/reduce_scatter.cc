@@ -190,7 +190,8 @@ HcclResult BuildHierarchyPlan(HcclComm comm, const OpParam &param, AlgResourceCt
     return HCCL_SUCCESS;
 }
 
-HcclResult RegisterHierarchicalKernels(HcclComm comm, const OpParam &param, AlgResourceCtx &resCtx)
+HcclResult RegisterHierarchicalKernels(HcclComm comm, const OpParam &param, bool useStaging,
+    AlgResourceCtx &resCtx)
 {
     std::vector<uint32_t> localPeers;
     for (uint32_t rank : resCtx.localRanks) {
@@ -213,6 +214,7 @@ HcclResult RegisterHierarchicalKernels(HcclComm comm, const OpParam &param, AlgR
     localArg->groupSize = static_cast<uint32_t>(resCtx.localRanks.size());
     localArg->groupRankId = localIndex;
     localArg->targetCount = static_cast<uint32_t>(resCtx.targetRanks.size());
+    localArg->useStaging = useStaging;
     localArg->dataType = param.dataType;
     localArg->reduceOp = param.reduceType;
     localArg->channelCount = static_cast<uint32_t>(localChannels.size());
@@ -253,7 +255,8 @@ HcclResult RegisterHierarchicalKernels(HcclComm comm, const OpParam &param, AlgR
     CHK_RET_CCU(HcommCcuKernelRegister(insHandle, 0, crossInfo.kernelFuncName, crossInfo.kernelFunc, crossArgs, 1,
         &resCtx.ccuKernels[1]));
     CHK_RET_CCU(HcommCcuKernelRegisterEnd(insHandle));
-    resCtx.algorithm = ReduceScatterAlgorithm::HIERARCHICAL;
+    resCtx.algorithm =
+        useStaging ? ReduceScatterAlgorithm::HIERARCHICAL_STAGING : ReduceScatterAlgorithm::HIERARCHICAL;
     return HCCL_SUCCESS;
 }
 
@@ -295,8 +298,10 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
     const uint64_t inputBytes = recvCount * sizeof(float) * param.rankSize;
     const bool useHierarchy = param.rankSize == 16 ||
         (param.rankSize == 12 && inputBytes > HIERARCHICAL_MIN_INPUT_BYTES);
+    const bool useHierarchicalStaging = useHierarchy && inputBytes > HIERARCHICAL_MIN_INPUT_BYTES;
     const bool useDirectMesh = param.rankSize == 4 && inputBytes <= SMALL_INPUT_BYTES;
-    const char *algorithmTag = useHierarchy ? "hier_v3" : (useDirectMesh ? "direct_v3" : "stage_v3");
+    const char *algorithmTag = useHierarchy ? (useHierarchicalStaging ? "hier_stage_v4" : "hier_direct_v4") :
+                                             (useDirectMesh ? "direct_v3" : "stage_v3");
     (void)snprintf(param.tag, sizeof(param.tag), "hccl_custom_reducescatter_%s", algorithmTag);
 
     // ==============================================
@@ -339,7 +344,7 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
         if (param.rankSize > 1) {
             if (useHierarchy) {
                 CHK_RET(BuildHierarchyPlan(comm, param, resCtxHost));
-                CHK_RET(RegisterHierarchicalKernels(comm, param, resCtxHost));
+                CHK_RET(RegisterHierarchicalKernels(comm, param, useHierarchicalStaging, resCtxHost));
             } else {
                 std::vector<ChannelHandle> channels;
                 CHK_RET(AcquireMeshChannels(comm, param, channels));
