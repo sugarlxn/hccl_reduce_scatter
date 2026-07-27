@@ -26,15 +26,8 @@
 #include "exec_op.h"
 #include "ccu_kernel.h"
 
-namespace ops_hccl {
-CcuResult CcuLocalReduceKernel(CcuKernelArg arg);
-CcuResult CcuCrossReduceKernel(CcuKernelArg arg);
-} // namespace ops_hccl
-
 namespace {
 constexpr uint32_t CHANNEL_NOTIFY_NUM = 1;
-constexpr uint64_t HIERARCHICAL_MIN_INPUT_BYTES = 1024 * 1024;
-constexpr uint64_t TWO_SERVER_HIERARCHICAL_MIN_INPUT_BYTES = 512 * 1024;
 
 HcclResult BuildChannelDesc(HcclComm comm, uint32_t netLayer, uint32_t myRank, uint32_t remoteRank,
     HcclChannelDesc &desc)
@@ -135,124 +128,6 @@ HcclResult RegisterKernel(HcclComm comm, const OpParam &param, const std::vector
     return HCCL_SUCCESS;
 }
 
-HcclResult BuildHierarchyPlan(HcclComm comm, const OpParam &param, AlgResourceCtx &resCtx)
-{
-    uint32_t *localRanks = nullptr;
-    uint32_t localRankNum = 0;
-    CHK_RET(HcclRankGraphGetRanksByLayer(comm, 0, &localRanks, &localRankNum));
-    CHK_PRT_RET(localRankNum == 0 || localRankNum > MAX_LOCAL_RANK_SIZE,
-        HCCL_ERROR("Invalid layer-0 group size %u", localRankNum), HCCL_E_NOT_SUPPORT);
-    resCtx.localRanks.assign(localRanks, localRanks + localRankNum);
-    std::sort(resCtx.localRanks.begin(), resCtx.localRanks.end());
-
-    const auto localIt = std::find(resCtx.localRanks.begin(), resCtx.localRanks.end(), param.myRank);
-    CHK_PRT_RET(localIt == resCtx.localRanks.end(), HCCL_ERROR("Local rank is absent from layer-0 group"),
-        HCCL_E_INTERNAL);
-    const uint32_t localIndex = static_cast<uint32_t>(localIt - resCtx.localRanks.begin());
-
-    std::vector<uint32_t> remoteRanks;
-    for (uint32_t rank = 0; rank < param.rankSize; ++rank) {
-        if (!std::binary_search(resCtx.localRanks.begin(), resCtx.localRanks.end(), rank)) {
-            remoteRanks.push_back(rank);
-        }
-    }
-
-    resCtx.targetRanks = {param.myRank};
-    if (param.rankSize == 16) {
-        CHK_PRT_RET(localRankNum != 8 || remoteRanks.size() != 8,
-            HCCL_ERROR("Unexpected 2x8 hierarchy"), HCCL_E_INTERNAL);
-        resCtx.targetRanks.push_back(remoteRanks[localIndex]);
-        resCtx.crossPeers.push_back(remoteRanks[localIndex]);
-        resCtx.crossSendTargetIndices.push_back(1);
-    } else if (param.rankSize == 12 && localRankNum == 8) {
-        CHK_PRT_RET(remoteRanks.size() != 4, HCCL_ERROR("Unexpected 8+4 hierarchy"), HCCL_E_INTERNAL);
-        const uint32_t remoteIndex = localIndex % 4;
-        resCtx.crossPeers.push_back(remoteRanks[remoteIndex]);
-        if (localIndex < 4) {
-            resCtx.targetRanks.push_back(remoteRanks[remoteIndex]);
-            resCtx.crossSendTargetIndices.push_back(1);
-        }
-    } else if (param.rankSize == 12 && localRankNum == 4) {
-        CHK_PRT_RET(remoteRanks.size() != 8, HCCL_ERROR("Unexpected 8+4 hierarchy"), HCCL_E_INTERNAL);
-        resCtx.targetRanks.push_back(remoteRanks[localIndex]);
-        resCtx.targetRanks.push_back(remoteRanks[localIndex + 4]);
-        resCtx.crossPeers.push_back(remoteRanks[localIndex]);
-        resCtx.crossPeers.push_back(remoteRanks[localIndex + 4]);
-        resCtx.crossSendTargetIndices = {1, 2};
-    } else {
-        HCCL_ERROR("Unsupported hierarchical topology: rankSize=%u, localSize=%u", param.rankSize, localRankNum);
-        return HCCL_E_NOT_SUPPORT;
-    }
-    return HCCL_SUCCESS;
-}
-
-HcclResult RegisterHierarchicalKernels(HcclComm comm, const OpParam &param, AlgResourceCtx &resCtx)
-{
-    std::vector<uint32_t> localPeers;
-    for (uint32_t rank : resCtx.localRanks) {
-        if (rank != param.myRank) {
-            localPeers.push_back(rank);
-        }
-    }
-    const uint32_t localIndex = static_cast<uint32_t>(
-        std::find(resCtx.localRanks.begin(), resCtx.localRanks.end(), param.myRank) - resCtx.localRanks.begin());
-
-    std::vector<ChannelHandle> localChannels;
-    std::vector<ChannelHandle> crossChannels;
-    CHK_RET(AcquireChannelsAtLayer(comm, param, 0, localPeers, localChannels));
-    CHK_RET(AcquireChannelsAtLayer(comm, param, 1, resCtx.crossPeers, crossChannels));
-
-    CcuKernelInfo localInfo{};
-    const char localName[] = "CcuLocalReduceKernel";
-    (void)std::memcpy(localInfo.kernelFuncName, localName, sizeof(localName));
-    localInfo.kernelFunc = reinterpret_cast<void *>(ops_hccl::CcuLocalReduceKernel);
-    auto localArg = std::make_shared<CcuLocalReduceKernelArg>();
-    localArg->groupSize = static_cast<uint32_t>(resCtx.localRanks.size());
-    localArg->groupRankId = localIndex;
-    localArg->targetCount = static_cast<uint32_t>(resCtx.targetRanks.size());
-    localArg->dataType = param.dataType;
-    localArg->reduceOp = param.reduceType;
-    localArg->channelCount = static_cast<uint32_t>(localChannels.size());
-    for (uint32_t i = 0; i < localChannels.size(); ++i) {
-        localArg->channels[i] = localChannels[i];
-    }
-    localInfo.setKernelArg(localArg);
-
-    CcuKernelInfo crossInfo{};
-    const char crossName[] = "CcuCrossReduceKernel";
-    (void)std::memcpy(crossInfo.kernelFuncName, crossName, sizeof(crossName));
-    crossInfo.kernelFunc = reinterpret_cast<void *>(ops_hccl::CcuCrossReduceKernel);
-    auto crossArg = std::make_shared<CcuCrossReduceKernelArg>();
-    crossArg->dataType = param.dataType;
-    crossArg->reduceOp = param.reduceType;
-    crossArg->channelCount = static_cast<uint32_t>(crossChannels.size());
-    crossArg->sendCount = static_cast<uint32_t>(resCtx.crossSendTargetIndices.size());
-    for (uint32_t i = 0; i < crossChannels.size(); ++i) {
-        crossArg->channels[i] = crossChannels[i];
-    }
-    for (uint32_t sendIdx = 0; sendIdx < crossArg->sendCount; ++sendIdx) {
-        const uint32_t targetRank = resCtx.targetRanks[resCtx.crossSendTargetIndices[sendIdx]];
-        const auto peerIt = std::find(resCtx.crossPeers.begin(), resCtx.crossPeers.end(), targetRank);
-        CHK_PRT_RET(peerIt == resCtx.crossPeers.end(), HCCL_ERROR("Cross target has no channel"), HCCL_E_INTERNAL);
-        crossArg->sendChannelIndices[sendIdx] = static_cast<uint32_t>(peerIt - resCtx.crossPeers.begin());
-    }
-    crossInfo.setKernelArg(crossArg);
-
-    CcuInsHandle insHandle = 0;
-    uint32_t insNum = 0;
-    CHK_RET(HcclCommQueryCcuIns(comm, &insHandle, &insNum));
-    CHK_PRT_RET(insNum != 1, HCCL_ERROR("Expected one CCU instruction instance, got %u", insNum), HCCL_E_INTERNAL);
-    resCtx.ccuKernels.resize(2);
-    CHK_RET_CCU(HcommCcuKernelRegisterStart(insHandle));
-    const void *localArgs[] = {localInfo.kernelArg};
-    const void *crossArgs[] = {crossInfo.kernelArg};
-    CHK_RET_CCU(HcommCcuKernelRegister(insHandle, 0, localInfo.kernelFuncName, localInfo.kernelFunc, localArgs, 1,
-        &resCtx.ccuKernels[0]));
-    CHK_RET_CCU(HcommCcuKernelRegister(insHandle, 0, crossInfo.kernelFuncName, crossInfo.kernelFunc, crossArgs, 1,
-        &resCtx.ccuKernels[1]));
-    CHK_RET_CCU(HcommCcuKernelRegisterEnd(insHandle));
-    return HCCL_SUCCESS;
-}
 } // namespace
 
 HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, HcclDataType dataType,
@@ -288,11 +163,9 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
         HCCL_ERROR("Unsupported rank size %u", param.rankSize), HCCL_E_NOT_SUPPORT);
     CHK_PRT_RET(dataType != HCCL_DATA_TYPE_FP32, HCCL_ERROR("Only float32 is supported"), HCCL_E_NOT_SUPPORT);
     CHK_PRT_RET(op != HCCL_REDUCE_SUM, HCCL_ERROR("Only sum reduction is supported"), HCCL_E_NOT_SUPPORT);
-    const uint64_t inputBytes = recvCount * sizeof(float) * param.rankSize;
-    const bool useHierarchy = param.rankSize > 4 &&
-        (inputBytes > HIERARCHICAL_MIN_INPUT_BYTES ||
-            (param.rankSize == 16 && inputBytes >= TWO_SERVER_HIERARCHICAL_MIN_INPUT_BYTES));
-    (void)snprintf(param.tag, sizeof(param.tag), "hccl_custom_reducescatter_%s", useHierarchy ? "hier" : "mesh");
+    // Every NPU in the updated topology has a direct layer-1 Clos endpoint.
+    // Keep all peer channels and the kernel on that IO Die.
+    (void)snprintf(param.tag, sizeof(param.tag), "hccl_custom_reducescatter_clos_v2");
 
     // ==============================================
     // STEP 2: 创建资源
@@ -332,14 +205,9 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
         resCtxHost.ccuThread = param.cpuThread;
 
         if (param.rankSize > 1) {
-            if (!useHierarchy) {
-                std::vector<ChannelHandle> channels;
-                CHK_RET(AcquireMeshChannels(comm, param, channels));
-                CHK_RET(RegisterKernel(comm, param, channels, resCtxHost));
-            } else {
-                CHK_RET(BuildHierarchyPlan(comm, param, resCtxHost));
-                CHK_RET(RegisterHierarchicalKernels(comm, param, resCtxHost));
-            }
+            std::vector<ChannelHandle> channels;
+            CHK_RET(AcquireMeshChannels(comm, param, channels));
+            CHK_RET(RegisterKernel(comm, param, channels, resCtxHost));
         }
 
         // ==============================================
