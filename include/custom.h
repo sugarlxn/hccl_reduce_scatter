@@ -28,6 +28,14 @@ struct CcuKernelArgBase {
     uint32_t channelCount;
 };
 
+// channels are ordered by increasing remote rank, with the local rank skipped.
+struct CcuReduceScatterKernelArg : public CcuKernelArgBase {
+    uint32_t rankSize;
+    uint32_t rankId;
+    HcclDataType dataType;
+    HcclReduceOp reduceOp;
+};
+
 // ccu kernel register所需信息
 struct CcuKernelInfo {
     // kernel名称

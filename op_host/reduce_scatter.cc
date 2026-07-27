@@ -11,12 +11,114 @@
 #include <hccl/hccl_res_expt.h>
 #include <hccl/hccl_rank_graph.h>
 #include <hccl/hccl_diag.h>
+#include <hccl/hccl_ccu_res.h>
+#include <ccu/ccu_launch.h>
+
+#include <algorithm>
+#include <cstring>
+#include <memory>
+#include <vector>
 
 #include "log.h"
 #include "common.h"
 #include "custom.h"
 #include "hccl.h"
 #include "exec_op.h"
+#include "ccu_kernel.h"
+
+namespace {
+constexpr uint32_t CHANNEL_NOTIFY_NUM = 1;
+
+HcclResult BuildChannelDesc(HcclComm comm, uint32_t netLayer, uint32_t myRank, uint32_t remoteRank,
+    HcclChannelDesc &desc)
+{
+    CommLink *links = nullptr;
+    uint32_t linkNum = 0;
+    CHK_RET(HcclRankGraphGetLinks(comm, netLayer, myRank, remoteRank, &links, &linkNum));
+
+    const CommLink *selected = nullptr;
+    for (uint32_t i = 0; i < linkNum; ++i) {
+        if (links[i].linkAttr.linkProtocol == CommProtocol::COMM_PROTOCOL_UBC_CTP) {
+            selected = &links[i];
+            break;
+        }
+    }
+    CHK_PRT_RET(selected == nullptr,
+        HCCL_ERROR("No CCU UBC_CTP link on layer %u from rank %u to rank %u", netLayer, myRank, remoteRank),
+        HCCL_E_NOT_FOUND);
+
+    CHK_RET(HcclChannelDescInit(&desc, 1));
+    desc.remoteRank = remoteRank;
+    desc.notifyNum = CHANNEL_NOTIFY_NUM;
+    desc.channelProtocol = selected->linkAttr.linkProtocol;
+    desc.localEndpoint = selected->srcEndpointDesc;
+    desc.remoteEndpoint = selected->dstEndpointDesc;
+    return HCCL_SUCCESS;
+}
+
+HcclResult AcquireChannels(HcclComm comm, const OpParam &param, std::vector<ChannelHandle> &channels)
+{
+    uint32_t *netLayers = nullptr;
+    uint32_t layerNum = 0;
+    CHK_RET(HcclRankGraphGetLayers(comm, &netLayers, &layerNum));
+    CHK_PRT_RET(layerNum == 0, HCCL_ERROR("Rank graph contains no network layer"), HCCL_E_INTERNAL);
+
+    // Use the highest layer that covers the whole communicator. In all three
+    // competition topologies this is Clos, keeping every channel on one IO Die.
+    uint32_t netLayer = netLayers[0];
+    for (uint32_t i = 1; i < layerNum; ++i) {
+        netLayer = std::max(netLayer, netLayers[i]);
+    }
+
+    std::vector<HcclChannelDesc> descs(param.rankSize - 1);
+    channels.resize(param.rankSize - 1);
+    uint32_t channelIdx = 0;
+    for (uint32_t remoteRank = 0; remoteRank < param.rankSize; ++remoteRank) {
+        if (remoteRank == param.myRank) {
+            continue;
+        }
+        CHK_RET(BuildChannelDesc(comm, netLayer, param.myRank, remoteRank, descs[channelIdx]));
+        ++channelIdx;
+    }
+    CHK_RET(HcclChannelAcquire(comm, CommEngine::COMM_ENGINE_CCU, descs.data(),
+        static_cast<uint32_t>(descs.size()), channels.data()));
+    return HCCL_SUCCESS;
+}
+
+HcclResult RegisterKernel(HcclComm comm, const OpParam &param, const std::vector<ChannelHandle> &channels,
+    AlgResourceCtx &resCtx)
+{
+    CcuKernelInfo kernelInfo{};
+    const char kernelName[] = "CcuKernel";
+    (void)std::memcpy(kernelInfo.kernelFuncName, kernelName, sizeof(kernelName));
+    kernelInfo.kernelFunc = reinterpret_cast<void *>(ops_hccl::CcuKernel);
+
+    auto kernelArg = std::make_shared<CcuReduceScatterKernelArg>();
+    kernelArg->rankSize = param.rankSize;
+    kernelArg->rankId = param.myRank;
+    kernelArg->dataType = param.dataType;
+    kernelArg->reduceOp = param.reduceType;
+    kernelArg->channelCount = static_cast<uint32_t>(channels.size());
+    for (uint32_t i = 0; i < channels.size(); ++i) {
+        kernelArg->channels[i] = channels[i];
+    }
+    kernelInfo.setKernelArg(kernelArg);
+
+    CcuInsHandle insHandle = 0;
+    uint32_t insNum = 0;
+    CHK_RET(HcclCommQueryCcuIns(comm, &insHandle, &insNum));
+    CHK_PRT_RET(insNum != 1, HCCL_ERROR("Expected one CCU instruction instance, got %u", insNum), HCCL_E_INTERNAL);
+
+    resCtx.ccuKernels.resize(1);
+    CHK_RET_CCU(HcommCcuKernelRegisterStart(insHandle));
+    const void *kernelArgs[] = {kernelInfo.kernelArg};
+    constexpr uint32_t DIE_ID_AUTO = 0;
+    CHK_RET_CCU(HcommCcuKernelRegister(insHandle, DIE_ID_AUTO, kernelInfo.kernelFuncName, kernelInfo.kernelFunc,
+        kernelArgs, 1, &resCtx.ccuKernels[0]));
+    CHK_RET_CCU(HcommCcuKernelRegisterEnd(insHandle));
+    return HCCL_SUCCESS;
+}
+} // namespace
 
 HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, HcclDataType dataType,
     HcclReduceOp op, HcclComm comm, aclrtStream stream)
@@ -34,6 +136,7 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
     param.count = recvCount;
     param.dataType = dataType;
     param.opType = HcclCMDType::HCCL_CMD_REDUCE_SCATTER;
+    param.reduceType = op;
 
     // 注册算子信息
     HcclDfxOpInfo dfxInfo;
@@ -46,6 +149,10 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
     // ==============================================
     CHK_RET(HcclGetRankId(comm, &param.myRank));
     CHK_RET(HcclGetRankSize(comm, &param.rankSize));
+    CHK_PRT_RET(param.rankSize == 0 || param.rankSize > MAX_RANK_SIZE,
+        HCCL_ERROR("Unsupported rank size %u", param.rankSize), HCCL_E_NOT_SUPPORT);
+    CHK_PRT_RET(dataType != HCCL_DATA_TYPE_FP32, HCCL_ERROR("Only float32 is supported"), HCCL_E_NOT_SUPPORT);
+    CHK_PRT_RET(op != HCCL_REDUCE_SUM, HCCL_ERROR("Only sum reduction is supported"), HCCL_E_NOT_SUPPORT);
 
     // ==============================================
     // STEP 2: 创建资源
@@ -79,24 +186,16 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
         // STEP 2.2: 申请资源：Thread、Channel、CCU Kernel
         // ==============================================
 
-        // TODO: 根据通信算法申请 Thread 资源
-        // 创建 CCU 通信引擎上的 thread 资源
-        uint32_t threadNum = 1;          // TODO: 按需修改所申请的 Thread 数量（>=1）
-        uint32_t notifyNumPerThread = 1; // TODO: 按需修改所申请的 Thread 上的 Notify 数量（>=1）
-
+        uint32_t threadNum = 1;
         resCtxHost.threads.resize(threadNum);
         resCtxHost.threads[0] = param.cpuThread;
-        if (threadNum > 1) {
-            CHK_RET(HcclThreadAcquire(comm, ccuEngine, threadNum - 1, notifyNumPerThread, &resCtxHost.threads[1]));
+        resCtxHost.ccuThread = param.cpuThread;
+
+        if (param.rankSize > 1) {
+            std::vector<ChannelHandle> channels;
+            CHK_RET(AcquireChannels(comm, param, channels));
+            CHK_RET(RegisterKernel(comm, param, channels, resCtxHost));
         }
-
-        // TODO: 根据通信算法申请 Channel 资源
-        // 调用 HcclRankGraphGetLinks()、HcclChannelDescInit()、HcclChannelAcquire() 等接口按需申请 Channel 资源
-
-        // TODO: 申请并注册 CCU Kernel 资源
-        // 调用 HcclCommQueryCcuIns()、HcommCcuKernelRegisterStart()、HcommCcuKernelRegister()、
-        //      HcommCcuKernelRegisterEnd() 等接口按需申请 1 个或多个 CCU Kernel 资源，并完成注册
-        // NOTE: 如果有多个 CCU Kernel，则需要分别注册
 
         // ==============================================
         // STEP 2.3: 申请通信引擎上下文
