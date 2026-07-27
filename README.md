@@ -14,14 +14,13 @@
 │   └── binary_stream.h             # 序列化类定义
 ├── op_host/                        # Host侧代码目录
 │   ├── reduce_scatter.cc           # ★ 选手编写：Host侧资源申请逻辑
-│   └── launch_aicpu_kernel.cc      # AICPU Kernel加载与下发逻辑
-└── op_kernel_aicpu/                # Device侧代码目录
-    ├── aicpu_kernel.cc             # AICPU Kernel函数实现
-    └── exec_op.cc                  # ★ 选手编写：通信算法编排逻辑
+│   └── exec_op.cc                  # ★ 选手编写：通信算法编排逻辑
+└── op_kernel_ccu/                  # CCU侧代码目录
+    └── ccu_kernel.cc               # ★ 选手编写：通信算法编排逻辑
 ```
 
 > [!NOTE] 注意：
-> 算子工程中已提前预制好固有逻辑，选手仅允许修改 `custom.h`、`reduce_scatter.cc`、`exec_op.cc` 共 3 个文件内容。
+> 算子工程中已提前预制好固有逻辑，选手仅允许修改 `custom.h`、`reduce_scatter.cc`、`exec_op.h`、`exec_op.cc`、`ccu_kernel.h`、`ccu_kernel.cc` 共 6 个文件内容。
 
 ## 2. 编译运行
 

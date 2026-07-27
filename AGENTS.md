@@ -13,7 +13,10 @@ Server内8个NPU之间为Full-Mesh互联，Server间通过Clos网络互通。
 
 ## 项目介绍
 
-[README](./README.md)
+- [README](./README.md)
+- [CCU demo](/home/workspace/hccl/examples/05_custom_ops_allgather/ccu/README.md)
+- [hccl](/home/workspace/hccl/README.md)
+- [hcomm](/home/workspace/hcomm/README.md)
 
 ## 二、核心定义与约束
 ### 2.1 函数原型与参数说明
@@ -77,10 +80,24 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
 
 ### 注意事项
 
-- 赛题为2层拓扑，允许使用layer-0和layer-1的链路，通过HcclRankGraphGetLayers接口可查出当前通信域的netLayers，包含0和1两层。可根据算法需要,选择对应层级的链路。
-- 考虑小数据量场景任务数量对性能的影响，小数据量下，通信任务执行时间短，通信任务数量过多，会导致任务下发的时延较大，影响最终性能。
+#### 赛题为2层拓扑，允许使用layer-0和layer-1的链路
+- 通过HcclRankGraphGetLayers接口可查出当前通信域的netLayers，包含0和1两层。可根据算法需要,选择对应层级的链路。
+- CCU模式，要同时使用layer-0和layer-1的链路时，需要将不同层的通信任务放到不同的CCU Kernel中。
+  - 一个Ascend 950 NPU包含2个IO Die，不同IO Die包含不同的网络设备。
+  - 在赛题给定的拓扑形态下，layer-0的网络设备和layer-1的网络设备分别分布在2个不同的IO Die上。
+  - 每个IO Die都有一个CCU，一个CCU不能跨Die使用另一个IO Die的网络设备进行通信。
+  - 在开发运行于某个CCU上的程序(ccu kernel)时，需要保证当一个ccu kernel使用的网络设备都在同一个IO Die上，CCU翻译器会自动根据它使用的网络设备推导出翻译后的指令序列应该部署到哪个CCU设备上。
 
-- 比赛经验tip:
+#### 规约类算子(如Allreduce/ReduceScatter算子)如何保证确定性?
+- 可通过cclBuffer中转，先将不同的数据存到cclBuffer不同地址段中，再按顺序对不同的数据做本地规约操作。
+- 也可通过算法设计来保证确定性，比如:
+  - Halving-Doubling\RING等算法因为每一步只接收一个对端发来的数据，天然保证确定性。
+  - MESH算法，可将数据进一步切片，不同的对端，在同一步内针对不同的内存段做读/写/规约的动作。
+
+#### 考虑小数据量场景任务数量对性能的影响
+- 小数据量下，通信任务执行时间短，通信任务数量过多，会导致任务下发的时延较大，影响最终性能。
+
+#### 比赛经验tip:
 1. notify的多打一问题：hccl-vm@checker插件当前还无法校验拦截notify的多打一问题（对于同一个notify资源的多组record和wait任务，需要保证时序，避免多个record通知同一个wait，导致另一个wait任务等待超时），会导致性能出分异常。建议同学们自查下算法逻辑；补充说明：Record任务本质上是往对应的notify寄存器上写1，Wait任务是确认notify寄存器是否被写1，写1了就可以继续执行后续任务同时将对应notify寄存器重置为0，两次Record都提前向同一个寄存器写了1，只有第一个Wait能正常完成并将寄存器重置为0，第二个Wait会一直等待（因为没有新的record再将该寄存器写1了）
 
 2. 一个对端申请多个channel
@@ -93,9 +110,8 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
 在开发运行于某个CCU上的程序(ccu kernel)时，需要保证当一个ccu kernel使用的网络设备都在同一个IO Die上，CCU翻译器会自动根据它使用的网络设备推导出翻译后的指令序列应该部署到哪个CCU设备上。
 
 4. AICPU模式下，部分数据面接口存在功能问题，如下接口暂无法使用：
-- HcommWriteWithNotifyOnThread
-- HcommWriteReduceWithNotifyOnThread
-
+  - HcommWriteWithNotifyOnThread
+  - HcommWriteReduceWithNotifyOnThread
 
 
 ## 编译方法

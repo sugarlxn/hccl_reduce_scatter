@@ -80,7 +80,7 @@ format() {
     cd "${PROJECT_DIR}"
     find ./include -type f -regex '.*\.\(h\|hpp\|cpp\|cc\)$' -exec clang-format -i {} \;
     find ./op_host -type f -regex '.*\.\(h\|hpp\|cpp\|cc\)$' -exec clang-format -i {} \;
-    find ./op_kernel_aicpu -type f -regex '.*\.\(h\|hpp\|cpp\|cc\)$' -exec clang-format -i {} \;
+    find ./op_kernel_ccu -type f -regex '.*\.\(h\|hpp\|cpp\|cc\)$' -exec clang-format -i {} \;
 }
 
 main() {
