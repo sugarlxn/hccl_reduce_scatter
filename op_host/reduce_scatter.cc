@@ -296,11 +296,10 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
     CHK_PRT_RET(dataType != HCCL_DATA_TYPE_FP32, HCCL_ERROR("Only float32 is supported"), HCCL_E_NOT_SUPPORT);
     CHK_PRT_RET(op != HCCL_REDUCE_SUM, HCCL_ERROR("Only sum reduction is supported"), HCCL_E_NOT_SUPPORT);
     const uint64_t inputBytes = recvCount * sizeof(float) * param.rankSize;
-    const bool useHierarchy = param.rankSize == 16 ||
-        (param.rankSize == 12 && inputBytes > HIERARCHICAL_MIN_INPUT_BYTES);
+    const bool useHierarchy = param.rankSize == 16 || param.rankSize == 12;
     const bool useHierarchicalStaging = useHierarchy && inputBytes > HIERARCHICAL_MIN_INPUT_BYTES;
     const bool useDirectMesh = param.rankSize == 4 && inputBytes <= SMALL_INPUT_BYTES;
-    const char *algorithmTag = useHierarchy ? (useHierarchicalStaging ? "hier_stage_v4" : "hier_direct_v4") :
+    const char *algorithmTag = useHierarchy ? (useHierarchicalStaging ? "hier_stage_v5" : "hier_direct_v5") :
                                              (useDirectMesh ? "direct_v3" : "stage_v3");
     (void)snprintf(param.tag, sizeof(param.tag), "hccl_custom_reducescatter_%s", algorithmTag);
 
