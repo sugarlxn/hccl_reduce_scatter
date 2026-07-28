@@ -56,11 +56,26 @@ struct CcuCrossReduceKernelArg : public CcuKernelArgBase {
     HcclReduceOp reduceOp;
 };
 
+struct CcuPartialReduceKernelArg : public CcuKernelArgBase {
+    uint32_t sourceCount;
+    uint32_t localSourceIndex;
+    bool includeLocalSource;
+    HcclDataType dataType;
+    HcclReduceOp reduceOp;
+};
+
+struct CcuMergePartialKernelArg : public CcuKernelArgBase {
+    HcclDataType dataType;
+    HcclReduceOp reduceOp;
+};
+
 enum class ReduceScatterAlgorithm : uint32_t {
     DIRECT_MESH = 0,
     STAGING_MESH = 1,
     HIERARCHICAL = 2,
     HIERARCHICAL_STAGING = 3,
+    DUAL_DIE_PARTIAL = 4,
+    SMALL_CLOS_PARALLEL = 5,
 };
 
 // ccu kernel register所需信息
