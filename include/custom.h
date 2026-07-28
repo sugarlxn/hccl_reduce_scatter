@@ -44,6 +44,7 @@ struct CcuLocalReduceKernelArg : public CcuKernelArgBase {
     uint32_t groupSize;
     uint32_t groupRankId;
     uint32_t targetCount;
+    bool useStaging;
     HcclDataType dataType;
     HcclReduceOp reduceOp;
 };
@@ -53,6 +54,13 @@ struct CcuCrossReduceKernelArg : public CcuKernelArgBase {
     uint32_t sendChannelIndices[MAX_CROSS_PEERS];
     HcclDataType dataType;
     HcclReduceOp reduceOp;
+};
+
+enum class ReduceScatterAlgorithm : uint32_t {
+    DIRECT_MESH = 0,
+    STAGING_MESH = 1,
+    HIERARCHICAL = 2,
+    HIERARCHICAL_STAGING = 3,
 };
 
 // ccu kernel register所需信息
@@ -76,6 +84,7 @@ public:
 };
 
 struct AlgResourceCtx {
+    ReduceScatterAlgorithm algorithm = ReduceScatterAlgorithm::DIRECT_MESH;
     ThreadHandle ccuThread;            ///< CCU通信引擎上的thread资源
     CommBuffer localBuffer;            ///< 本端HCCL通信内存
     std::vector<ThreadHandle> threads; ///< CCU通信引擎上的thread资源
@@ -89,6 +98,7 @@ struct AlgResourceCtx {
     std::vector<char> Serialize()
     {
         BinaryStream binaryStream;
+        binaryStream << algorithm;
         binaryStream << ccuThread;
         binaryStream << localBuffer;
         binaryStream << threads;
@@ -106,6 +116,7 @@ struct AlgResourceCtx {
     void DeSerialize(std::vector<char> &data)
     {
         BinaryStream binaryStream(data);
+        binaryStream >> algorithm;
         binaryStream >> ccuThread;
         binaryStream >> localBuffer;
         binaryStream >> threads;

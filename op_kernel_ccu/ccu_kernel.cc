@@ -34,6 +34,88 @@ CcuResult CcuKernel(CcuKernelArg arg)
         return CCU_E_PARA;
     }
 
+    constexpr uint32_t REMOTE_INPUT_ADDR_ID = 1;
+    constexpr uint32_t REMOTE_INPUT_TOKEN_ID = 2;
+    constexpr uint32_t CHANNEL_NOTIFY_INDEX = 0;
+    constexpr uint16_t INPUT_ADDR_READY = 1U << 1;
+    constexpr uint16_t INPUT_TOKEN_READY = 1U << 2;
+
+    ccu::Variable outputAddr;
+    ccu::Variable outputToken;
+    ccu::Variable inputAddr;
+    ccu::Variable inputToken;
+    ccu::Variable sourceOffset;
+    ccu::Variable chunkBytes;
+    uint32_t argId = 0;
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(outputAddr, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(outputToken, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(inputAddr, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(inputToken, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(sourceOffset, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(chunkBytes, argId++));
+
+    std::vector<ccu::Variable> remoteInputAddr(kernelArg->rankSize);
+    std::vector<ccu::Variable> remoteInputToken(kernelArg->rankSize);
+    uint32_t channelIdx = 0;
+    for (uint32_t peer = 0; peer < kernelArg->rankSize; ++peer) {
+        if (peer == kernelArg->rankId) {
+            remoteInputAddr[peer] = inputAddr;
+            remoteInputToken[peer] = inputToken;
+            continue;
+        }
+        remoteInputAddr[peer] =
+            ccu::GetResByChannel<ccu::Variable>(kernelArg->channels[channelIdx], REMOTE_INPUT_ADDR_ID);
+        remoteInputToken[peer] =
+            ccu::GetResByChannel<ccu::Variable>(kernelArg->channels[channelIdx], REMOTE_INPUT_TOKEN_ID);
+        CCU_RETURN_IF_ERROR(ccu::WriteVariableWithNotify(kernelArg->channels[channelIdx], inputAddr,
+            REMOTE_INPUT_ADDR_ID, CHANNEL_NOTIFY_INDEX, INPUT_ADDR_READY));
+        CCU_RETURN_IF_ERROR(ccu::WriteVariableWithNotify(kernelArg->channels[channelIdx], inputToken,
+            REMOTE_INPUT_TOKEN_ID, CHANNEL_NOTIFY_INDEX, INPUT_TOKEN_READY));
+        ++channelIdx;
+    }
+    for (uint32_t i = 0; i < kernelArg->channelCount; ++i) {
+        CCU_RETURN_IF_ERROR(ccu::NotifyWait(kernelArg->channels[i], CHANNEL_NOTIFY_INDEX,
+            static_cast<uint16_t>(INPUT_ADDR_READY | INPUT_TOKEN_READY)));
+    }
+
+    // Each rank starts with its local contribution. Subsequent source ranks use
+    // a fixed cyclic order, so FP32 accumulation is deterministic. At every
+    // step sourceRank=(rankId+step)%rankSize is a permutation: every Clos port
+    // serves exactly one peer and all ranks progress in parallel.
+    ccu::LocalAddr dst;
+    dst.addr = outputAddr;
+    dst.token = outputToken;
+
+    ccu::LocalAddr localSrc;
+    localSrc.addr = inputAddr;
+    localSrc.addr += sourceOffset;
+    localSrc.token = inputToken;
+    ccu::Event reduceEvent;
+    CCU_RETURN_IF_ERROR(ccu::LocalCopy(dst, localSrc, chunkBytes, reduceEvent));
+    CCU_RETURN_IF_ERROR(ccu::EventWait(reduceEvent));
+
+    for (uint32_t step = 1; step < kernelArg->rankSize; ++step) {
+        const uint32_t sourceRank = (kernelArg->rankId + step) % kernelArg->rankSize;
+        const uint32_t sourceChannel = sourceRank < kernelArg->rankId ? sourceRank : sourceRank - 1;
+        ccu::RemoteAddr remoteSrc;
+        remoteSrc.addr = remoteInputAddr[sourceRank];
+        remoteSrc.addr += sourceOffset;
+        remoteSrc.token = remoteInputToken[sourceRank];
+        CCU_RETURN_IF_ERROR(ccu::ReadReduce(kernelArg->channels[sourceChannel], dst, remoteSrc, chunkBytes,
+            kernelArg->dataType, kernelArg->reduceOp, reduceEvent));
+        CCU_RETURN_IF_ERROR(ccu::EventWait(reduceEvent));
+    }
+
+    return CCU_SUCCESS;
+}
+
+CcuResult CcuStagingKernel(CcuKernelArg arg)
+{
+    auto *kernelArg = static_cast<CcuReduceScatterKernelArg *>(arg);
+    if (kernelArg == nullptr || kernelArg->rankSize < 2 || kernelArg->channelCount != kernelArg->rankSize - 1) {
+        return CCU_E_PARA;
+    }
+
     constexpr uint32_t REMOTE_CCL_ADDR_ID = 1;
     constexpr uint32_t REMOTE_CCL_TOKEN_ID = 2;
     constexpr uint32_t CHANNEL_NOTIFY_INDEX = 0;
@@ -80,11 +162,9 @@ CcuResult CcuKernel(CcuKernelArg arg)
         remoteCclToken[peer] =
             ccu::GetResByChannel<ccu::Variable>(kernelArg->channels[channelIdx], REMOTE_CCL_TOKEN_ID);
         CCU_RETURN_IF_ERROR(ccu::WriteVariableWithNotify(kernelArg->channels[channelIdx], localCclAddr,
-            REMOTE_CCL_ADDR_ID,
-            CHANNEL_NOTIFY_INDEX, CCL_ADDR_READY));
+            REMOTE_CCL_ADDR_ID, CHANNEL_NOTIFY_INDEX, CCL_ADDR_READY));
         CCU_RETURN_IF_ERROR(ccu::WriteVariableWithNotify(kernelArg->channels[channelIdx], localCclToken,
-            REMOTE_CCL_TOKEN_ID,
-            CHANNEL_NOTIFY_INDEX, CCL_TOKEN_READY));
+            REMOTE_CCL_TOKEN_ID, CHANNEL_NOTIFY_INDEX, CCL_TOKEN_READY));
         ++channelIdx;
     }
     for (uint32_t i = 0; i < kernelArg->channelCount; ++i) {
@@ -96,14 +176,12 @@ CcuResult CcuKernel(CcuKernelArg arg)
     ccu::LocalAddr localSrc;
     localSrc.addr = sourceAddrs[kernelArg->rankId];
     localSrc.token = inputToken;
-
     ccu::LocalAddr localStage;
     localStage.addr = stageAddrs[kernelArg->rankId];
     localStage.token = localCclToken;
     CCU_RETURN_IF_ERROR(ccu::LocalCopy(localStage, localSrc, chunkBytes, transferEvent,
         static_cast<uint16_t>(1U << kernelArg->rankId)));
 
-    // Send only the chunk owned by each peer into that peer's source slot.
     channelIdx = 0;
     for (uint32_t peer = 0; peer < kernelArg->rankSize; ++peer) {
         if (peer == kernelArg->rankId) {
@@ -112,7 +190,6 @@ CcuResult CcuKernel(CcuKernelArg arg)
         ccu::LocalAddr src;
         src.addr = sourceAddrs[peer];
         src.token = inputToken;
-
         ccu::RemoteAddr dst;
         dst.addr = remoteCclAddr[peer];
         dst.token = remoteCclToken[peer];
@@ -131,7 +208,6 @@ CcuResult CcuKernel(CcuKernelArg arg)
         CCU_RETURN_IF_ERROR(ccu::NotifyWait(kernelArg->channels[i], CHANNEL_NOTIFY_INDEX, DATA_READY));
     }
 
-    // Fixed rank order makes floating-point sum deterministic.
     ccu::LocalAddr dst;
     dst.addr = outputAddr;
     dst.token = outputToken;
@@ -148,14 +224,12 @@ CcuResult CcuKernel(CcuKernelArg arg)
         CCU_RETURN_IF_ERROR(ccu::EventWait(reduceEvent));
     }
 
-    // Protect the shared staging slots before the next sliced launch.
     for (uint32_t i = 0; i < kernelArg->channelCount; ++i) {
         CCU_RETURN_IF_ERROR(ccu::NotifyRecord(kernelArg->channels[i], CHANNEL_NOTIFY_INDEX, REDUCE_DONE));
     }
     for (uint32_t i = 0; i < kernelArg->channelCount; ++i) {
         CCU_RETURN_IF_ERROR(ccu::NotifyWait(kernelArg->channels[i], CHANNEL_NOTIFY_INDEX, REDUCE_DONE));
     }
-
     return CCU_SUCCESS;
 }
 
@@ -178,20 +252,30 @@ CcuResult CcuLocalReduceKernel(CcuKernelArg arg)
     ccu::Variable inputToken;
     ccu::Variable cclToken;
     ccu::Variable chunkBytes;
+    ccu::Variable tileBytes;
+    ccu::Variable tailBytes;
     std::vector<ccu::Variable> targetOffsets(kernelArg->targetCount);
-    std::vector<ccu::Variable> stageAddrs(kernelArg->targetCount * kernelArg->groupSize);
+    constexpr uint32_t STAGING_BANK_COUNT = 2;
+    std::vector<ccu::Variable> stageAddrs(
+        kernelArg->useStaging ? STAGING_BANK_COUNT * kernelArg->groupSize : 0);
     std::vector<ccu::Variable> dstAddrs(kernelArg->targetCount);
     std::vector<ccu::Variable> dstTokens(kernelArg->targetCount);
     uint32_t argId = 0;
     CCU_RETURN_IF_ERROR(ccu::LoadArg(inputAddr, argId++));
     CCU_RETURN_IF_ERROR(ccu::LoadArg(inputToken, argId++));
-    CCU_RETURN_IF_ERROR(ccu::LoadArg(cclToken, argId++));
+    if (kernelArg->useStaging) {
+        CCU_RETURN_IF_ERROR(ccu::LoadArg(cclToken, argId++));
+    }
     CCU_RETURN_IF_ERROR(ccu::LoadArg(chunkBytes, argId++));
+    if (kernelArg->useStaging) {
+        CCU_RETURN_IF_ERROR(ccu::LoadArg(tileBytes, argId++));
+        CCU_RETURN_IF_ERROR(ccu::LoadArg(tailBytes, argId++));
+    }
     for (uint32_t target = 0; target < kernelArg->targetCount; ++target) {
         CCU_RETURN_IF_ERROR(ccu::LoadArg(targetOffsets[target], argId++));
     }
-    for (uint32_t slot = 0; slot < stageAddrs.size(); ++slot) {
-        CCU_RETURN_IF_ERROR(ccu::LoadArg(stageAddrs[slot], argId++));
+    for (uint32_t source = 0; source < stageAddrs.size(); ++source) {
+        CCU_RETURN_IF_ERROR(ccu::LoadArg(stageAddrs[source], argId++));
     }
     for (uint32_t target = 0; target < kernelArg->targetCount; ++target) {
         CCU_RETURN_IF_ERROR(ccu::LoadArg(dstAddrs[target], argId++));
@@ -224,49 +308,152 @@ CcuResult CcuLocalReduceKernel(CcuKernelArg arg)
             static_cast<uint16_t>(INPUT_ADDR_READY | INPUT_TOKEN_READY)));
     }
 
-    std::vector<ccu::Event> transferEvents(kernelArg->targetCount);
+    if (kernelArg->useStaging) {
+        // Double-buffer each target. Bank 1 is fetched while bank 0 is reduced
+        // in fixed source order, overlapping Mesh traffic and local reduction.
+        ccu::Event transferEvent;
+        ccu::Event reduceEvent;
+        const uint16_t groupMask = static_cast<uint16_t>((1U << kernelArg->groupSize) - 1U);
+        for (uint32_t target = 0; target < kernelArg->targetCount; ++target) {
+            for (uint32_t source = 0; source < kernelArg->groupSize; ++source) {
+                ccu::LocalAddr stage;
+                stage.addr = stageAddrs[source];
+                stage.token = cclToken;
+                const uint16_t mask = static_cast<uint16_t>(1U << source);
+                if (source == kernelArg->groupRankId) {
+                    ccu::LocalAddr src;
+                    src.addr = inputAddr;
+                    src.addr += targetOffsets[target];
+                    src.token = inputToken;
+                    CCU_RETURN_IF_ERROR(ccu::LocalCopy(stage, src, tileBytes, transferEvent, mask));
+                } else {
+                    const uint32_t sourceChannel = source < kernelArg->groupRankId ? source : source - 1;
+                    ccu::RemoteAddr src;
+                    src.addr = remoteInputAddr[source];
+                    src.addr += targetOffsets[target];
+                    src.token = remoteInputToken[source];
+                    CCU_RETURN_IF_ERROR(
+                        ccu::Read(kernelArg->channels[sourceChannel], stage, src, tileBytes, transferEvent, mask));
+                }
+            }
+            CCU_RETURN_IF_ERROR(ccu::EventWait(transferEvent, groupMask));
+
+            CCU_IF(tailBytes != 0) {
+                // Start bank 1 before reducing bank 0.
+                for (uint32_t source = 0; source < kernelArg->groupSize; ++source) {
+                    ccu::LocalAddr stage;
+                    stage.addr = stageAddrs[kernelArg->groupSize + source];
+                    stage.token = cclToken;
+                    const uint16_t mask = static_cast<uint16_t>(1U << source);
+                    if (source == kernelArg->groupRankId) {
+                        ccu::LocalAddr src;
+                        src.addr = inputAddr;
+                        src.addr += targetOffsets[target];
+                        src.addr += tileBytes;
+                        src.token = inputToken;
+                        CCU_RETURN_IF_ERROR(ccu::LocalCopy(stage, src, tailBytes, transferEvent, mask));
+                    } else {
+                        const uint32_t sourceChannel = source < kernelArg->groupRankId ? source : source - 1;
+                        ccu::RemoteAddr src;
+                        src.addr = remoteInputAddr[source];
+                        src.addr += targetOffsets[target];
+                        src.addr += tileBytes;
+                        src.token = remoteInputToken[source];
+                        CCU_RETURN_IF_ERROR(ccu::Read(
+                            kernelArg->channels[sourceChannel], stage, src, tailBytes, transferEvent, mask));
+                    }
+                }
+            }
+
+            ccu::LocalAddr dst;
+            dst.addr = dstAddrs[target];
+            dst.token = dstTokens[target];
+            ccu::LocalAddr staged;
+            staged.addr = stageAddrs[0];
+            staged.token = cclToken;
+            CCU_RETURN_IF_ERROR(ccu::LocalCopy(dst, staged, tileBytes, reduceEvent));
+            CCU_RETURN_IF_ERROR(ccu::EventWait(reduceEvent));
+            for (uint32_t source = 1; source < kernelArg->groupSize; ++source) {
+                staged.addr = stageAddrs[source];
+                CCU_RETURN_IF_ERROR(
+                    ccu::LocalReduce(dst, staged, tileBytes, kernelArg->dataType, kernelArg->reduceOp, reduceEvent));
+                CCU_RETURN_IF_ERROR(ccu::EventWait(reduceEvent));
+            }
+
+            CCU_IF(tailBytes != 0)
+            {
+                CCU_RETURN_IF_ERROR(ccu::EventWait(transferEvent, groupMask));
+                dst.addr = dstAddrs[target];
+                dst.addr += tileBytes;
+                staged.addr = stageAddrs[kernelArg->groupSize];
+                CCU_RETURN_IF_ERROR(ccu::LocalCopy(dst, staged, tailBytes, reduceEvent));
+                CCU_RETURN_IF_ERROR(ccu::EventWait(reduceEvent));
+                for (uint32_t source = 1; source < kernelArg->groupSize; ++source) {
+                    staged.addr = stageAddrs[kernelArg->groupSize + source];
+                    CCU_RETURN_IF_ERROR(ccu::LocalReduce(
+                        dst, staged, tailBytes, kernelArg->dataType, kernelArg->reduceOp, reduceEvent));
+                    CCU_RETURN_IF_ERROR(ccu::EventWait(reduceEvent));
+                }
+            }
+        }
+        return CCU_SUCCESS;
+    }
+
+    // Give each independent target a different cyclic source order. Each
+    // result still has a fixed deterministic order, while one round uses
+    // different full-mesh links instead of serializing all targets on one
+    // peer/channel (especially important for the 4-rank side of 8+4).
+    std::vector<ccu::Event> reduceEvents(kernelArg->targetCount);
     for (uint32_t target = 0; target < kernelArg->targetCount; ++target) {
-        for (uint32_t source = 0; source < kernelArg->groupSize; ++source) {
-            const uint32_t slot = target * kernelArg->groupSize + source;
-            ccu::LocalAddr stage;
-            stage.addr = stageAddrs[slot];
-            stage.token = cclToken;
-            const uint16_t mask = static_cast<uint16_t>(1U << source);
+        const uint32_t source = target;
+        ccu::LocalAddr dst;
+        dst.addr = dstAddrs[target];
+        dst.token = dstTokens[target];
+        if (kernelArg->groupRankId == source) {
+            ccu::LocalAddr src;
+            src.addr = inputAddr;
+            src.addr += targetOffsets[target];
+            src.token = inputToken;
+            CCU_RETURN_IF_ERROR(ccu::LocalCopy(dst, src, chunkBytes, reduceEvents[target]));
+        } else {
+            const uint32_t sourceChannel = source < kernelArg->groupRankId ? source : source - 1;
+            ccu::RemoteAddr src;
+            src.addr = remoteInputAddr[source];
+            src.addr += targetOffsets[target];
+            src.token = remoteInputToken[source];
+            CCU_RETURN_IF_ERROR(
+                ccu::Read(kernelArg->channels[sourceChannel], dst, src, chunkBytes, reduceEvents[target]));
+        }
+    }
+    for (uint32_t target = 0; target < kernelArg->targetCount; ++target) {
+        CCU_RETURN_IF_ERROR(ccu::EventWait(reduceEvents[target]));
+    }
+
+    for (uint32_t step = 1; step < kernelArg->groupSize; ++step) {
+        for (uint32_t target = 0; target < kernelArg->targetCount; ++target) {
+            const uint32_t source = (target + step) % kernelArg->groupSize;
+            ccu::LocalAddr dst;
+            dst.addr = dstAddrs[target];
+            dst.token = dstTokens[target];
             if (source == kernelArg->groupRankId) {
                 ccu::LocalAddr src;
                 src.addr = inputAddr;
                 src.addr += targetOffsets[target];
                 src.token = inputToken;
-                CCU_RETURN_IF_ERROR(ccu::LocalCopy(stage, src, chunkBytes, transferEvents[target], mask));
+                CCU_RETURN_IF_ERROR(ccu::LocalReduce(dst, src, chunkBytes, kernelArg->dataType,
+                    kernelArg->reduceOp, reduceEvents[target]));
             } else {
                 const uint32_t sourceChannel = source < kernelArg->groupRankId ? source : source - 1;
                 ccu::RemoteAddr src;
                 src.addr = remoteInputAddr[source];
                 src.addr += targetOffsets[target];
                 src.token = remoteInputToken[source];
-                CCU_RETURN_IF_ERROR(
-                    ccu::Read(kernelArg->channels[sourceChannel], stage, src, chunkBytes, transferEvents[target], mask));
+                CCU_RETURN_IF_ERROR(ccu::ReadReduce(kernelArg->channels[sourceChannel], dst, src, chunkBytes,
+                    kernelArg->dataType, kernelArg->reduceOp, reduceEvents[target]));
             }
         }
-    }
-
-    const uint16_t groupMask = static_cast<uint16_t>((1U << kernelArg->groupSize) - 1U);
-    ccu::Event reduceEvent;
-    for (uint32_t target = 0; target < kernelArg->targetCount; ++target) {
-        CCU_RETURN_IF_ERROR(ccu::EventWait(transferEvents[target], groupMask));
-        ccu::LocalAddr dst;
-        dst.addr = dstAddrs[target];
-        dst.token = dstTokens[target];
-        ccu::LocalAddr staged;
-        staged.addr = stageAddrs[target * kernelArg->groupSize];
-        staged.token = cclToken;
-        CCU_RETURN_IF_ERROR(ccu::LocalCopy(dst, staged, chunkBytes, reduceEvent));
-        CCU_RETURN_IF_ERROR(ccu::EventWait(reduceEvent));
-        for (uint32_t source = 1; source < kernelArg->groupSize; ++source) {
-            staged.addr = stageAddrs[target * kernelArg->groupSize + source];
-            CCU_RETURN_IF_ERROR(
-                ccu::LocalReduce(dst, staged, chunkBytes, kernelArg->dataType, kernelArg->reduceOp, reduceEvent));
-            CCU_RETURN_IF_ERROR(ccu::EventWait(reduceEvent));
+        for (uint32_t target = 0; target < kernelArg->targetCount; ++target) {
+            CCU_RETURN_IF_ERROR(ccu::EventWait(reduceEvents[target]));
         }
     }
     return CCU_SUCCESS;
@@ -280,12 +467,11 @@ CcuResult CcuCrossReduceKernel(CcuKernelArg arg)
         return CCU_E_PARA;
     }
 
-    constexpr uint32_t REMOTE_OUTPUT_ADDR_ID = 1;
-    constexpr uint32_t REMOTE_OUTPUT_TOKEN_ID = 2;
+    constexpr uint32_t REMOTE_PARTIAL_ADDR_ID = 1;
+    constexpr uint32_t REMOTE_PARTIAL_TOKEN_ID = 2;
     constexpr uint32_t CHANNEL_NOTIFY_INDEX = 0;
-    constexpr uint16_t OUTPUT_ADDR_READY = 1U << 1;
-    constexpr uint16_t OUTPUT_TOKEN_READY = 1U << 2;
-    constexpr uint16_t REDUCE_DONE = 1U << 3;
+    constexpr uint16_t PARTIAL_ADDR_READY = 1U << 1;
+    constexpr uint16_t PARTIAL_TOKEN_READY = 1U << 2;
 
     ccu::Variable outputAddr;
     ccu::Variable outputToken;
@@ -301,45 +487,46 @@ CcuResult CcuCrossReduceKernel(CcuKernelArg arg)
         CCU_RETURN_IF_ERROR(ccu::LoadArg(sendAddrs[sendIdx], argId++));
     }
 
-    std::vector<ccu::Variable> remoteOutputAddr(kernelArg->channelCount);
-    std::vector<ccu::Variable> remoteOutputToken(kernelArg->channelCount);
+    std::vector<ccu::Variable> remotePartialAddr(kernelArg->channelCount);
+    std::vector<ccu::Variable> remotePartialToken(kernelArg->channelCount);
     for (uint32_t i = 0; i < kernelArg->channelCount; ++i) {
-        remoteOutputAddr[i] =
-            ccu::GetResByChannel<ccu::Variable>(kernelArg->channels[i], REMOTE_OUTPUT_ADDR_ID);
-        remoteOutputToken[i] =
-            ccu::GetResByChannel<ccu::Variable>(kernelArg->channels[i], REMOTE_OUTPUT_TOKEN_ID);
-        CCU_RETURN_IF_ERROR(ccu::WriteVariableWithNotify(kernelArg->channels[i], outputAddr, REMOTE_OUTPUT_ADDR_ID,
-            CHANNEL_NOTIFY_INDEX, OUTPUT_ADDR_READY));
-        CCU_RETURN_IF_ERROR(ccu::WriteVariableWithNotify(kernelArg->channels[i], outputToken, REMOTE_OUTPUT_TOKEN_ID,
-            CHANNEL_NOTIFY_INDEX, OUTPUT_TOKEN_READY));
+        remotePartialAddr[i] =
+            ccu::GetResByChannel<ccu::Variable>(kernelArg->channels[i], REMOTE_PARTIAL_ADDR_ID);
+        remotePartialToken[i] =
+            ccu::GetResByChannel<ccu::Variable>(kernelArg->channels[i], REMOTE_PARTIAL_TOKEN_ID);
+
+        ccu::Variable advertisedAddr;
+        ccu::Variable advertisedToken;
+        advertisedAddr = outputAddr;
+        advertisedToken = outputToken;
+        for (uint32_t sendIdx = 0; sendIdx < kernelArg->sendCount; ++sendIdx) {
+            if (kernelArg->sendChannelIndices[sendIdx] == i) {
+                advertisedAddr = sendAddrs[sendIdx];
+                advertisedToken = cclToken;
+            }
+        }
+        CCU_RETURN_IF_ERROR(ccu::WriteVariableWithNotify(kernelArg->channels[i], advertisedAddr,
+            REMOTE_PARTIAL_ADDR_ID, CHANNEL_NOTIFY_INDEX, PARTIAL_ADDR_READY));
+        CCU_RETURN_IF_ERROR(ccu::WriteVariableWithNotify(kernelArg->channels[i], advertisedToken,
+            REMOTE_PARTIAL_TOKEN_ID, CHANNEL_NOTIFY_INDEX, PARTIAL_TOKEN_READY));
     }
     for (uint32_t i = 0; i < kernelArg->channelCount; ++i) {
         CCU_RETURN_IF_ERROR(ccu::NotifyWait(kernelArg->channels[i], CHANNEL_NOTIFY_INDEX,
-            static_cast<uint16_t>(OUTPUT_ADDR_READY | OUTPUT_TOKEN_READY)));
+            static_cast<uint16_t>(PARTIAL_ADDR_READY | PARTIAL_TOKEN_READY)));
     }
 
-    ccu::Event writeEvent;
-    for (uint32_t sendIdx = 0; sendIdx < kernelArg->sendCount; ++sendIdx) {
-        const uint32_t channel = kernelArg->sendChannelIndices[sendIdx];
-        ccu::LocalAddr src;
-        src.addr = sendAddrs[sendIdx];
-        src.token = cclToken;
-        ccu::RemoteAddr dst;
-        dst.addr = remoteOutputAddr[channel];
-        dst.token = remoteOutputToken[channel];
-        CCU_RETURN_IF_ERROR(ccu::WriteReduce(kernelArg->channels[channel], dst, src, chunkBytes,
-            kernelArg->dataType, kernelArg->reduceOp, writeEvent, static_cast<uint16_t>(1U << sendIdx)));
-    }
-    if (kernelArg->sendCount > 0) {
-        const uint16_t sendMask = static_cast<uint16_t>((1U << kernelArg->sendCount) - 1U);
-        CCU_RETURN_IF_ERROR(ccu::EventWait(writeEvent, sendMask));
-    }
-    for (uint32_t i = 0; i < kernelArg->channelCount; ++i) {
-        CCU_RETURN_IF_ERROR(ccu::NotifyRecord(kernelArg->channels[i], CHANNEL_NOTIFY_INDEX, REDUCE_DONE));
-    }
-    for (uint32_t i = 0; i < kernelArg->channelCount; ++i) {
-        CCU_RETURN_IF_ERROR(ccu::NotifyWait(kernelArg->channels[i], CHANNEL_NOTIFY_INDEX, REDUCE_DONE));
-    }
+    // Each rank needs one peer partial. A pull completes locally, eliminating
+    // the post-write notify barrier while preserving the same reduction order.
+    ccu::LocalAddr dst;
+    dst.addr = outputAddr;
+    dst.token = outputToken;
+    ccu::RemoteAddr src;
+    src.addr = remotePartialAddr[0];
+    src.token = remotePartialToken[0];
+    ccu::Event readEvent;
+    CCU_RETURN_IF_ERROR(ccu::ReadReduce(kernelArg->channels[0], dst, src, chunkBytes,
+        kernelArg->dataType, kernelArg->reduceOp, readEvent));
+    CCU_RETURN_IF_ERROR(ccu::EventWait(readEvent));
     return CCU_SUCCESS;
 }
 

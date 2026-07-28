@@ -1,3 +1,7 @@
 排名,提交人,提交时间,分数,测试点1,测试点2,测试点3,测试点4,测试点5,测试点6,测试点7,测试点8,测试点9,测试点10,测试点11,测试点12,测试点13,测试点14,测试点15,测试点16,测试点17,测试点18
-1,BenchMark,2026/07/27 13:41:43,214.84,pass,pass,pass,pass,pass,pass,pass,pass,pass,22.00μs,1.77ms,1.35ms,18.00μs,2.50ms,1.96ms,42.00μs,2.22ms,1.73ms
-8,lxn,2026/07/27 16:03:41,135.00,pass,pass,pass,pass,pass,pass,pass,pass,pass,-,-,-,-,-,-,-,-,-
+1,BenchMark,2026/07/27 13:41:43,214.84,pass,pass,pass,pass,pass,pass,pass,pass,pass,19.00μs,1.77ms,1.35ms,15.00μs,2.27ms,1.81ms,24.00μs,2.22ms,1.73ms
+8,ccu-v1.1,2026/07/27 16:49:29,192.10,pass,pass,pass,pass,pass,pass,pass,pass,pass,50.00μs,1.88ms,1.49ms,23.00μs,2.56ms,1.97ms,42.00μs,3.53ms,2.75ms
+12,ccu-v2.0,2026/07/27 19:47:29,175.31,pass,pass,pass,pass,pass,pass,pass,pass,pass,65.00μs,4.90ms,3.82ms,18.00μs,3.12ms,2.34ms,51.00μs,4.55ms,4.24ms
+11,ccu-v2.1,2026/07/27 21:53:32,177.61,pass,pass,pass,pass,pass,pass,pass,pass,pass,37.00μs,5.80ms,4.54ms,18.00μs,2.52ms,1.96ms,42.00μs,7.93ms,6.20ms
+11,ccu-v2.2,2026/07/28 00:44:59,189.01,pass,pass,pass,pass,pass,pass,pass,pass,pass,37.00μs,1.91ms,1.50ms,18.00μs,2.55ms,1.97ms,42.00μs,3.61ms,2.83ms
+10,ccu-v2.3,2026/07/28 11:32:09,190.67,pass,pass,pass,pass,pass,pass,pass,pass,pass,35.00μs,1.87ms,1.46ms,18.00μs,2.53ms,1.98ms,37.00μs,3.56ms,2.83ms

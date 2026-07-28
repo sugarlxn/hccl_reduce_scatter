@@ -27,12 +27,14 @@
 #include "ccu_kernel.h"
 
 namespace ops_hccl {
+CcuResult CcuStagingKernel(CcuKernelArg arg);
 CcuResult CcuLocalReduceKernel(CcuKernelArg arg);
 CcuResult CcuCrossReduceKernel(CcuKernelArg arg);
 } // namespace ops_hccl
 
 namespace {
 constexpr uint32_t CHANNEL_NOTIFY_NUM = 1;
+constexpr uint64_t SMALL_INPUT_BYTES = 512 * 1024;
 constexpr uint64_t HIERARCHICAL_MIN_INPUT_BYTES = 1024 * 1024;
 
 HcclResult BuildChannelDesc(HcclComm comm, uint32_t netLayer, uint32_t myRank, uint32_t remoteRank,
@@ -100,13 +102,15 @@ HcclResult AcquireMeshChannels(HcclComm comm, const OpParam &param, std::vector<
     return AcquireChannelsAtLayer(comm, param, netLayer, peers, channels);
 }
 
-HcclResult RegisterKernel(HcclComm comm, const OpParam &param, const std::vector<ChannelHandle> &channels,
-    AlgResourceCtx &resCtx)
+HcclResult RegisterMeshKernel(HcclComm comm, const OpParam &param, const std::vector<ChannelHandle> &channels,
+    ReduceScatterAlgorithm algorithm, AlgResourceCtx &resCtx)
 {
     CcuKernelInfo kernelInfo{};
-    const char kernelName[] = "CcuKernel";
-    (void)std::memcpy(kernelInfo.kernelFuncName, kernelName, sizeof(kernelName));
-    kernelInfo.kernelFunc = reinterpret_cast<void *>(ops_hccl::CcuKernel);
+    const bool direct = algorithm == ReduceScatterAlgorithm::DIRECT_MESH;
+    const char *kernelName = direct ? "CcuKernel" : "CcuStagingKernel";
+    (void)snprintf(kernelInfo.kernelFuncName, sizeof(kernelInfo.kernelFuncName), "%s", kernelName);
+    kernelInfo.kernelFunc =
+        direct ? reinterpret_cast<void *>(ops_hccl::CcuKernel) : reinterpret_cast<void *>(ops_hccl::CcuStagingKernel);
 
     auto kernelArg = std::make_shared<CcuReduceScatterKernelArg>();
     kernelArg->rankSize = param.rankSize;
@@ -131,6 +135,7 @@ HcclResult RegisterKernel(HcclComm comm, const OpParam &param, const std::vector
     CHK_RET_CCU(HcommCcuKernelRegister(insHandle, DIE_ID_AUTO, kernelInfo.kernelFuncName, kernelInfo.kernelFunc,
         kernelArgs, 1, &resCtx.ccuKernels[0]));
     CHK_RET_CCU(HcommCcuKernelRegisterEnd(insHandle));
+    resCtx.algorithm = algorithm;
     return HCCL_SUCCESS;
 }
 
@@ -185,7 +190,8 @@ HcclResult BuildHierarchyPlan(HcclComm comm, const OpParam &param, AlgResourceCt
     return HCCL_SUCCESS;
 }
 
-HcclResult RegisterHierarchicalKernels(HcclComm comm, const OpParam &param, AlgResourceCtx &resCtx)
+HcclResult RegisterHierarchicalKernels(HcclComm comm, const OpParam &param, bool useStaging,
+    AlgResourceCtx &resCtx)
 {
     std::vector<uint32_t> localPeers;
     for (uint32_t rank : resCtx.localRanks) {
@@ -202,13 +208,13 @@ HcclResult RegisterHierarchicalKernels(HcclComm comm, const OpParam &param, AlgR
     CHK_RET(AcquireChannelsAtLayer(comm, param, 1, resCtx.crossPeers, crossChannels));
 
     CcuKernelInfo localInfo{};
-    const char localName[] = "CcuLocalReduceKernel";
-    (void)std::memcpy(localInfo.kernelFuncName, localName, sizeof(localName));
+    (void)snprintf(localInfo.kernelFuncName, sizeof(localInfo.kernelFuncName), "%s", "CcuLocalReduceKernel");
     localInfo.kernelFunc = reinterpret_cast<void *>(ops_hccl::CcuLocalReduceKernel);
     auto localArg = std::make_shared<CcuLocalReduceKernelArg>();
     localArg->groupSize = static_cast<uint32_t>(resCtx.localRanks.size());
     localArg->groupRankId = localIndex;
     localArg->targetCount = static_cast<uint32_t>(resCtx.targetRanks.size());
+    localArg->useStaging = useStaging;
     localArg->dataType = param.dataType;
     localArg->reduceOp = param.reduceType;
     localArg->channelCount = static_cast<uint32_t>(localChannels.size());
@@ -218,8 +224,7 @@ HcclResult RegisterHierarchicalKernels(HcclComm comm, const OpParam &param, AlgR
     localInfo.setKernelArg(localArg);
 
     CcuKernelInfo crossInfo{};
-    const char crossName[] = "CcuCrossReduceKernel";
-    (void)std::memcpy(crossInfo.kernelFuncName, crossName, sizeof(crossName));
+    (void)snprintf(crossInfo.kernelFuncName, sizeof(crossInfo.kernelFuncName), "%s", "CcuCrossReduceKernel");
     crossInfo.kernelFunc = reinterpret_cast<void *>(ops_hccl::CcuCrossReduceKernel);
     auto crossArg = std::make_shared<CcuCrossReduceKernelArg>();
     crossArg->dataType = param.dataType;
@@ -250,8 +255,11 @@ HcclResult RegisterHierarchicalKernels(HcclComm comm, const OpParam &param, AlgR
     CHK_RET_CCU(HcommCcuKernelRegister(insHandle, 0, crossInfo.kernelFuncName, crossInfo.kernelFunc, crossArgs, 1,
         &resCtx.ccuKernels[1]));
     CHK_RET_CCU(HcommCcuKernelRegisterEnd(insHandle));
+    resCtx.algorithm =
+        useStaging ? ReduceScatterAlgorithm::HIERARCHICAL_STAGING : ReduceScatterAlgorithm::HIERARCHICAL;
     return HCCL_SUCCESS;
 }
+
 } // namespace
 
 HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, HcclDataType dataType,
@@ -287,9 +295,13 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
         HCCL_ERROR("Unsupported rank size %u", param.rankSize), HCCL_E_NOT_SUPPORT);
     CHK_PRT_RET(dataType != HCCL_DATA_TYPE_FP32, HCCL_ERROR("Only float32 is supported"), HCCL_E_NOT_SUPPORT);
     CHK_PRT_RET(op != HCCL_REDUCE_SUM, HCCL_ERROR("Only sum reduction is supported"), HCCL_E_NOT_SUPPORT);
-    const bool useHierarchy = param.rankSize > 4 && recvCount * sizeof(float) * param.rankSize >
-        HIERARCHICAL_MIN_INPUT_BYTES;
-    (void)snprintf(param.tag, sizeof(param.tag), "hccl_custom_reducescatter_%s", useHierarchy ? "hier" : "mesh");
+    const uint64_t inputBytes = recvCount * sizeof(float) * param.rankSize;
+    const bool useHierarchy = param.rankSize == 16 || param.rankSize == 12;
+    const bool useHierarchicalStaging = useHierarchy && inputBytes > HIERARCHICAL_MIN_INPUT_BYTES;
+    const bool useDirectMesh = param.rankSize == 4 && inputBytes <= SMALL_INPUT_BYTES;
+    const char *algorithmTag = useHierarchy ? (useHierarchicalStaging ? "hier_stage_v5" : "hier_direct_v5") :
+                                             (useDirectMesh ? "direct_v3" : "stage_v3");
+    (void)snprintf(param.tag, sizeof(param.tag), "hccl_custom_reducescatter_%s", algorithmTag);
 
     // ==============================================
     // STEP 2: 创建资源
@@ -329,13 +341,15 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
         resCtxHost.ccuThread = param.cpuThread;
 
         if (param.rankSize > 1) {
-            if (!useHierarchy) {
+            if (useHierarchy) {
+                CHK_RET(BuildHierarchyPlan(comm, param, resCtxHost));
+                CHK_RET(RegisterHierarchicalKernels(comm, param, useHierarchicalStaging, resCtxHost));
+            } else {
                 std::vector<ChannelHandle> channels;
                 CHK_RET(AcquireMeshChannels(comm, param, channels));
-                CHK_RET(RegisterKernel(comm, param, channels, resCtxHost));
-            } else {
-                CHK_RET(BuildHierarchyPlan(comm, param, resCtxHost));
-                CHK_RET(RegisterHierarchicalKernels(comm, param, resCtxHost));
+                const auto algorithm = useDirectMesh ? ReduceScatterAlgorithm::DIRECT_MESH :
+                                                       ReduceScatterAlgorithm::STAGING_MESH;
+                CHK_RET(RegisterMeshKernel(comm, param, channels, algorithm, resCtxHost));
             }
         }
 

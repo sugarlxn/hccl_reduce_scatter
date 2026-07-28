@@ -70,6 +70,12 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
 - 每天统一出1次性能分，取第二天凌晨3点前最后1次提交的代码进行性能评分。
 - 需保证功能用例全部通过才能参与性能评分。
 
+| 测试点     | 测试点1      | 测试点2      | 测试点3         | 测试点4      | 测试点5      | 测试点6         | 测试点7      | 测试点8      | 测试点9         | 测试点10     | 测试点11     | 测试点12        | 测试点13     | 测试点14     | 测试点15        | 测试点16     | 测试点17     | 测试点18        |
+| ------- | --------- | --------- | ------------ | --------- | --------- | ------------ | --------- | --------- | ------------ | --------- | --------- | ------------ | --------- | --------- | ------------ | --------- | --------- | ------------ |
+| 拓扑与数据大小 | 2×8，512KB | 2×8，512MB | 2×8，400MB+4B | 4×1，512KB | 4×1，512MB | 4×1，400MB+4B | 8+4，512KB | 8+4，512MB | 8+4，400MB+4B | 2×8，512KB | 2×8，512MB | 2×8，400MB+4B | 4×1，512KB | 4×1，512MB | 4×1，400MB+4B | 8+4，512KB | 8+4，512MB | 8+4，400MB+4B |
+| 测试类型    | 功能测试      | 功能测试      | 功能测试         | 功能测试      | 功能测试      | 功能测试         | 功能测试      | 功能测试      | 功能测试         | 性能测试      | 性能测试      | 性能测试         | 性能测试      | 性能测试      | 性能测试         | 性能测试      | 性能测试      | 性能测试         |
+
+
 ### 拓展信息
 
 信息同步：
@@ -119,17 +125,22 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
 ```shell
 bash build.sh
 ```
+
+**编译通过即可，仿真测试由我来手动完成**
+
 完整的Ascend 环境安装在路径: `/home/workspace`
 包括：`Ascend`、`hccl`、`hcomm`
 
+编译完成后需要运行 `cp_build.sh` 将编译产物拷贝到对应目录
 
-## 用例
+
+## 仿真-checker
 ```shell
   source /home/workspace/Ascend/cann-9.1.0/set_env.sh
   source /home/workspace/hcomm/test/hccl_vm/hccl_vm_install/script/hccl_config.sh   # 设 RANK_TABLE_FILE 等运行变量
-  cd /home/workspace/hcomm/test/hccl_vm/hccl_vm_install/bin && ./hccl-vm start ascend950_cluster_32_server_normal.yaml
-    (hvm)$> hccl-vm mock-comm 112
-    (hvm)$> mpirun --allow-run-as-root --oversubscribe -np 2 /home/workspace/Ascend/cann-9.1.0/tools/hccl_test/bin/alltoall_test -b 64 -e 64 -d int32 -o sum -w 0 -n 1 -c 1
+ cd /home/workspace/hcomm/test/hccl_vm/hccl_vm_install/bin && ./hccl-vm start ascend950_cluster_32_server_normal.yaml
+    (hvm)$> hccl-vm mock-comm 128
+    (hvm)$> mpirun --allow-run-as-root --oversubscribe -np 16 /home/workspace/Ascend/cann-9.1.0/tools/hccl_test/bin/reduce_scatter_test -b 512K -e 512K -d fp32 -o sum -w 0 -n 1 -c 1 > /home/ubuntu/hccl_reduce_scatter/reduce_scatter_test.log
     (hvm)$> hccl-vm plugin run @checker
     (hvm)$> exit
   更多集群配置与用例见 /home/workspace/hcomm/test/hccl_vm/README-Competition.md §4
