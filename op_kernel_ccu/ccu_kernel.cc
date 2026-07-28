@@ -309,37 +309,41 @@ CcuResult CcuLocalReduceKernel(CcuKernelArg arg)
     }
 
     if (kernelArg->useStaging) {
-        // Double-buffer each target. Bank 1 is fetched while bank 0 is reduced
-        // in fixed source order, overlapping Mesh traffic and local reduction.
+        // Prime bank 0 for the first target. Reads from different peers use
+        // independent links and are issued before the single masked wait.
         ccu::Event transferEvent;
         ccu::Event reduceEvent;
         const uint16_t groupMask = static_cast<uint16_t>((1U << kernelArg->groupSize) - 1U);
-        for (uint32_t target = 0; target < kernelArg->targetCount; ++target) {
-            for (uint32_t source = 0; source < kernelArg->groupSize; ++source) {
-                ccu::LocalAddr stage;
-                stage.addr = stageAddrs[source];
-                stage.token = cclToken;
-                const uint16_t mask = static_cast<uint16_t>(1U << source);
-                if (source == kernelArg->groupRankId) {
-                    ccu::LocalAddr src;
-                    src.addr = inputAddr;
-                    src.addr += targetOffsets[target];
-                    src.token = inputToken;
-                    CCU_RETURN_IF_ERROR(ccu::LocalCopy(stage, src, tileBytes, transferEvent, mask));
-                } else {
-                    const uint32_t sourceChannel = source < kernelArg->groupRankId ? source : source - 1;
-                    ccu::RemoteAddr src;
-                    src.addr = remoteInputAddr[source];
-                    src.addr += targetOffsets[target];
-                    src.token = remoteInputToken[source];
-                    CCU_RETURN_IF_ERROR(
-                        ccu::Read(kernelArg->channels[sourceChannel], stage, src, tileBytes, transferEvent, mask));
-                }
+        for (uint32_t source = 0; source < kernelArg->groupSize; ++source) {
+            ccu::LocalAddr stage;
+            stage.addr = stageAddrs[source];
+            stage.token = cclToken;
+            const uint16_t mask = static_cast<uint16_t>(1U << source);
+            if (source == kernelArg->groupRankId) {
+                ccu::LocalAddr src;
+                src.addr = inputAddr;
+                src.addr += targetOffsets[0];
+                src.token = inputToken;
+                CCU_RETURN_IF_ERROR(ccu::LocalCopy(stage, src, tileBytes, transferEvent, mask));
+            } else {
+                const uint32_t sourceChannel = source < kernelArg->groupRankId ? source : source - 1;
+                ccu::RemoteAddr src;
+                src.addr = remoteInputAddr[source];
+                src.addr += targetOffsets[0];
+                src.token = remoteInputToken[source];
+                CCU_RETURN_IF_ERROR(
+                    ccu::Read(kernelArg->channels[sourceChannel], stage, src, tileBytes, transferEvent, mask));
             }
-            CCU_RETURN_IF_ERROR(ccu::EventWait(transferEvent, groupMask));
+        }
+        CCU_RETURN_IF_ERROR(ccu::EventWait(transferEvent, groupMask));
 
+        // A two-bank pipeline spans target boundaries:
+        //   fetch current tail | reduce current head
+        //   fetch next head    | reduce current tail
+        // Every reduction still consumes sources in the fixed [0, groupSize)
+        // order, so floating-point results remain deterministic.
+        for (uint32_t target = 0; target < kernelArg->targetCount; ++target) {
             CCU_IF(tailBytes != 0) {
-                // Start bank 1 before reducing bank 0.
                 for (uint32_t source = 0; source < kernelArg->groupSize; ++source) {
                     ccu::LocalAddr stage;
                     stage.addr = stageAddrs[kernelArg->groupSize + source];
@@ -383,6 +387,32 @@ CcuResult CcuLocalReduceKernel(CcuKernelArg arg)
             CCU_IF(tailBytes != 0)
             {
                 CCU_RETURN_IF_ERROR(ccu::EventWait(transferEvent, groupMask));
+
+                if (target + 1 < kernelArg->targetCount) {
+                    for (uint32_t source = 0; source < kernelArg->groupSize; ++source) {
+                        ccu::LocalAddr stage;
+                        stage.addr = stageAddrs[source];
+                        stage.token = cclToken;
+                        const uint16_t mask = static_cast<uint16_t>(1U << source);
+                        if (source == kernelArg->groupRankId) {
+                            ccu::LocalAddr src;
+                            src.addr = inputAddr;
+                            src.addr += targetOffsets[target + 1];
+                            src.token = inputToken;
+                            CCU_RETURN_IF_ERROR(ccu::LocalCopy(stage, src, tileBytes, transferEvent, mask));
+                        } else {
+                            const uint32_t sourceChannel =
+                                source < kernelArg->groupRankId ? source : source - 1;
+                            ccu::RemoteAddr src;
+                            src.addr = remoteInputAddr[source];
+                            src.addr += targetOffsets[target + 1];
+                            src.token = remoteInputToken[source];
+                            CCU_RETURN_IF_ERROR(ccu::Read(
+                                kernelArg->channels[sourceChannel], stage, src, tileBytes, transferEvent, mask));
+                        }
+                    }
+                }
+
                 dst.addr = dstAddrs[target];
                 dst.addr += tileBytes;
                 staged.addr = stageAddrs[kernelArg->groupSize];
@@ -393,6 +423,10 @@ CcuResult CcuLocalReduceKernel(CcuKernelArg arg)
                     CCU_RETURN_IF_ERROR(ccu::LocalReduce(
                         dst, staged, tailBytes, kernelArg->dataType, kernelArg->reduceOp, reduceEvent));
                     CCU_RETURN_IF_ERROR(ccu::EventWait(reduceEvent));
+                }
+
+                if (target + 1 < kernelArg->targetCount) {
+                    CCU_RETURN_IF_ERROR(ccu::EventWait(transferEvent, groupMask));
                 }
             }
         }

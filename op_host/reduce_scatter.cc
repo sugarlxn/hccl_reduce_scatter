@@ -299,7 +299,7 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
     const bool useHierarchy = param.rankSize == 16 || param.rankSize == 12;
     const bool useHierarchicalStaging = useHierarchy && inputBytes > HIERARCHICAL_MIN_INPUT_BYTES;
     const bool useDirectMesh = param.rankSize == 4 && inputBytes <= SMALL_INPUT_BYTES;
-    const char *algorithmTag = useHierarchy ? (useHierarchicalStaging ? "hier_stage_v5" : "hier_direct_v5") :
+    const char *algorithmTag = useHierarchy ? (useHierarchicalStaging ? "hier_stage_v6" : "hier_direct_v5") :
                                              (useDirectMesh ? "direct_v3" : "stage_v3");
     (void)snprintf(param.tag, sizeof(param.tag), "hccl_custom_reducescatter_%s", algorithmTag);
 

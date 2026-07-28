@@ -115,8 +115,15 @@ HcclResult ExecOp(const OpParam &param)
         }
         localArgs.push_back(chunkBytes);
         if (hierarchicalStaging) {
-            localArgs.push_back(std::min(slotStride, chunkBytes));
-            localArgs.push_back(chunkBytes - std::min(slotStride, chunkBytes));
+            // Keep both banks close to the same size. The local kernel pipelines
+            // bank 1 traffic with bank 0 reduction and, across targets, the next
+            // bank 0 traffic with the current bank 1 reduction. An oversized
+            // first bank leaves too little work in the second bank to hide the
+            // following transfer.
+            const uint64_t tileBytes =
+                std::min(slotStride, ((chunkBytes + dataTypeSize) / (2 * dataTypeSize)) * dataTypeSize);
+            localArgs.push_back(tileBytes);
+            localArgs.push_back(chunkBytes - tileBytes);
         }
         for (uint32_t targetRank : resCtx.targetRanks) {
             localArgs.push_back(targetRank * recvBytes + chunkOffset);
