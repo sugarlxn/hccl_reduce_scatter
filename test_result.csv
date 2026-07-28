@@ -7,3 +7,4 @@
 10,ccu-v2.3,2026/07/28 11:32:09,190.67,pass,pass,pass,pass,pass,pass,pass,pass,pass,35.00μs,1.87ms,1.46ms,18.00μs,2.53ms,1.98ms,37.00μs,3.56ms,2.83ms
 13,ccu-v2.4,2026/07/28 13:55:36,184.26,pass,pass,pass,pass,pass,pass,pass,pass,pass,35.00μs,1.84ms,1.43ms,18.00μs,2.54ms,1.97ms,37.00μs,3.51ms,2.73ms
 3,ccu-v3.0,2026/07/28 17:25:16,198.53,pass,pass,pass,pass,pass,pass,pass,pass,pass,24.00μs,1.86ms,1.41ms,18.00μs,2.51ms,1.96ms,22.00μs,2.26ms,1.77ms
+4,ccu-v3.1,2026/07/28 19:10:23,192.48,pass,pass,pass,pass,pass,pass,pass,pass,pass,24.00μs,1.78ms,1.40ms,18.00μs,2.53ms,1.96ms,21.00μs,2.18ms,1.69ms
