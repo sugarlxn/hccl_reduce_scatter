@@ -31,6 +31,7 @@ CcuResult CcuStagingKernel(CcuKernelArg arg);
 CcuResult CcuLocalReduceKernel(CcuKernelArg arg);
 CcuResult CcuCrossReduceKernel(CcuKernelArg arg);
 CcuResult CcuPartialReduceKernel(CcuKernelArg arg);
+CcuResult CcuMergePartialKernel(CcuKernelArg arg);
 } // namespace ops_hccl
 
 namespace {
@@ -251,29 +252,40 @@ HcclResult RegisterDualDiePartialKernels(HcclComm comm, const OpParam &param, Al
 
     CcuKernelInfo localInfo{};
     CcuKernelInfo crossInfo{};
+    CcuKernelInfo mergeInfo{};
     (void)snprintf(localInfo.kernelFuncName, sizeof(localInfo.kernelFuncName), "%s", "CcuPartialReduceKernel");
     (void)snprintf(crossInfo.kernelFuncName, sizeof(crossInfo.kernelFuncName), "%s", "CcuPartialReduceKernel");
+    (void)snprintf(mergeInfo.kernelFuncName, sizeof(mergeInfo.kernelFuncName), "%s", "CcuMergePartialKernel");
     localInfo.kernelFunc = reinterpret_cast<void *>(ops_hccl::CcuPartialReduceKernel);
     crossInfo.kernelFunc = reinterpret_cast<void *>(ops_hccl::CcuPartialReduceKernel);
+    mergeInfo.kernelFunc = reinterpret_cast<void *>(ops_hccl::CcuMergePartialKernel);
     localInfo.setKernelArg(MakePartialKernelArg(param, localChannels,
         static_cast<uint32_t>(resCtx.localRanks.size()), true, localIndex));
     crossInfo.setKernelArg(MakePartialKernelArg(param, crossChannels,
         static_cast<uint32_t>(resCtx.crossPeers.size()), false, 0));
+    auto mergeKernelArg = std::make_shared<CcuMergePartialKernelArg>();
+    mergeKernelArg->dataType = param.dataType;
+    mergeKernelArg->reduceOp = param.reduceType;
+    mergeKernelArg->channelCount = 0;
+    mergeInfo.setKernelArg(mergeKernelArg);
 
     CcuInsHandle insHandle = 0;
     uint32_t insNum = 0;
     CHK_RET(HcclCommQueryCcuIns(comm, &insHandle, &insNum));
     CHK_PRT_RET(insNum != 1, HCCL_ERROR("Expected one CCU instruction instance, got %u", insNum), HCCL_E_INTERNAL);
 
-    resCtx.ccuKernels.resize(2);
+    resCtx.ccuKernels.resize(3);
     CHK_RET_CCU(HcommCcuKernelRegisterStart(insHandle));
     const void *localArgs[] = {localInfo.kernelArg};
     const void *crossArgs[] = {crossInfo.kernelArg};
+    const void *mergeArgs[] = {mergeInfo.kernelArg};
     constexpr uint32_t DIE_ID_AUTO = 0;
     CHK_RET_CCU(HcommCcuKernelRegister(insHandle, DIE_ID_AUTO, localInfo.kernelFuncName, localInfo.kernelFunc,
         localArgs, 1, &resCtx.ccuKernels[0]));
     CHK_RET_CCU(HcommCcuKernelRegister(insHandle, DIE_ID_AUTO, crossInfo.kernelFuncName, crossInfo.kernelFunc,
         crossArgs, 1, &resCtx.ccuKernels[1]));
+    CHK_RET_CCU(HcommCcuKernelRegister(insHandle, DIE_ID_AUTO, mergeInfo.kernelFuncName, mergeInfo.kernelFunc,
+        mergeArgs, 1, &resCtx.ccuKernels[2]));
     CHK_RET_CCU(HcommCcuKernelRegisterEnd(insHandle));
     resCtx.algorithm = ReduceScatterAlgorithm::DUAL_DIE_PARTIAL;
     return HCCL_SUCCESS;

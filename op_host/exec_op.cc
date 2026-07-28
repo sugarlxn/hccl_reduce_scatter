@@ -58,7 +58,7 @@ HcclResult ExecOp(const OpParam &param)
     if (resCtx.algorithm == ReduceScatterAlgorithm::DUAL_DIE_PARTIAL ||
         resCtx.algorithm == ReduceScatterAlgorithm::SMALL_CLOS_PARALLEL) {
         const bool dualDie = resCtx.algorithm == ReduceScatterAlgorithm::DUAL_DIE_PARTIAL;
-        CHK_PRT_RET(resCtx.ccuKernels.size() != (dualDie ? 2U : 1U) ||
+        CHK_PRT_RET(resCtx.ccuKernels.size() != (dualDie ? 3U : 1U) ||
                 resCtx.threads.size() != (dualDie ? 2U : 1U),
             HCCL_ERROR("Incomplete partial-reduce resources"), HCCL_E_INTERNAL);
 
@@ -141,9 +141,10 @@ HcclResult ExecOp(const OpParam &param)
             HcommThreadNotifyWaitOnThreadWithDefaultTimeout(resCtx.threads[0], 0)));
         CHK_RET(static_cast<HcclResult>(
             HcommThreadNotifyRecordOnThread(resCtx.threads[1], resCtx.threads[0], 0)));
-        CHK_RET(static_cast<HcclResult>(HcommLocalReduceOnThread(resCtx.threads[0],
-            reinterpret_cast<void *>(outputAddr), reinterpret_cast<const void *>(crossPartialAddr), param.count,
-            static_cast<HcommDataType>(param.dataType), static_cast<HcommReduceOp>(param.reduceType))));
+        const std::vector<uint64_t> mergeArgs = {
+            outputAddr, outputToken, crossPartialAddr, cclToken, recvBytes};
+        CHK_RET_CCU(HcommCcuKernelLaunch(resCtx.threads[0], resCtx.ccuKernels[2], mergeArgs.data(),
+            static_cast<uint32_t>(mergeArgs.size())));
         return HCCL_SUCCESS;
     }
 

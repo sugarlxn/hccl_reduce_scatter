@@ -64,6 +64,11 @@ struct CcuPartialReduceKernelArg : public CcuKernelArgBase {
     HcclReduceOp reduceOp;
 };
 
+struct CcuMergePartialKernelArg : public CcuKernelArgBase {
+    HcclDataType dataType;
+    HcclReduceOp reduceOp;
+};
+
 enum class ReduceScatterAlgorithm : uint32_t {
     DIRECT_MESH = 0,
     STAGING_MESH = 1,

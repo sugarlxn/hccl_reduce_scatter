@@ -683,6 +683,38 @@ CcuResult CcuPartialReduceKernel(CcuKernelArg arg)
     return CCU_SUCCESS;
 }
 
+CcuResult CcuMergePartialKernel(CcuKernelArg arg)
+{
+    auto *kernelArg = static_cast<CcuMergePartialKernelArg *>(arg);
+    if (kernelArg == nullptr) {
+        return CCU_E_PARA;
+    }
+
+    ccu::Variable outputAddr;
+    ccu::Variable outputToken;
+    ccu::Variable crossPartialAddr;
+    ccu::Variable cclToken;
+    ccu::Variable recvBytes;
+    uint32_t argId = 0;
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(outputAddr, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(outputToken, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(crossPartialAddr, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(cclToken, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(recvBytes, argId++));
+
+    ccu::LocalAddr output;
+    output.addr = outputAddr;
+    output.token = outputToken;
+    ccu::LocalAddr crossPartial;
+    crossPartial.addr = crossPartialAddr;
+    crossPartial.token = cclToken;
+    ccu::Event reduceEvent;
+    CCU_RETURN_IF_ERROR(ccu::LocalReduce(output, crossPartial, recvBytes,
+        kernelArg->dataType, kernelArg->reduceOp, reduceEvent));
+    CCU_RETURN_IF_ERROR(ccu::EventWait(reduceEvent));
+    return CCU_SUCCESS;
+}
+
 CcuResult CcuCrossReduceKernel(CcuKernelArg arg)
 {
     auto *kernelArg = static_cast<CcuCrossReduceKernelArg *>(arg);
