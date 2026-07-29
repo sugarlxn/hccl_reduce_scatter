@@ -124,8 +124,22 @@ HcclResult ExecOp(const OpParam &param)
             return HCCL_SUCCESS;
         }
 
-        const std::vector<uint64_t> crossArgs =
-            makePartialArgs(crossPartialAddr, cclToken, crossScratchAddr, crossSourceCount);
+        std::vector<uint64_t> crossArgs;
+        if (param.rankSize == 16) {
+            constexpr uint64_t STRIPE_COUNT = 8;
+            const uint64_t baseStripeCount = param.count / STRIPE_COUNT;
+            const uint64_t extraElements = param.count % STRIPE_COUNT;
+            uint64_t stripeOffset = 0;
+            crossArgs = {crossPartialAddr, cclToken, inputAddr, inputToken, sourceOffset};
+            for (uint64_t stripe = 0; stripe < STRIPE_COUNT; ++stripe) {
+                const uint64_t stripeCount = baseStripeCount + (stripe < extraElements ? 1 : 0);
+                crossArgs.push_back(stripeOffset);
+                crossArgs.push_back(stripeCount * dataTypeSize);
+                stripeOffset += stripeCount * dataTypeSize;
+            }
+        } else {
+            crossArgs = makePartialArgs(crossPartialAddr, cclToken, crossScratchAddr, crossSourceCount);
+        }
 
         // Main and slave threads target different IO Dies. The pre/post notify
         // pair brackets both launches without serializing their data paths.

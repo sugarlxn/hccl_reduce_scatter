@@ -731,6 +731,86 @@ CcuResult CcuPartialReduceKernel(CcuKernelArg arg)
     return CCU_SUCCESS;
 }
 
+CcuResult CcuStripedPartialKernel(CcuKernelArg arg)
+{
+    auto *kernelArg = static_cast<CcuPartialReduceKernelArg *>(arg);
+    constexpr uint32_t STRIPE_COUNT = 8;
+    if (kernelArg == nullptr || kernelArg->sourceCount != STRIPE_COUNT ||
+        kernelArg->channelCount != STRIPE_COUNT || kernelArg->includeLocalSource) {
+        return CCU_E_PARA;
+    }
+
+    constexpr uint32_t REMOTE_INPUT_ADDR_ID = 1;
+    constexpr uint32_t REMOTE_INPUT_TOKEN_ID = 2;
+    constexpr uint32_t CHANNEL_NOTIFY_INDEX = 0;
+    constexpr uint16_t INPUT_ADDR_READY = 1U << 1;
+    constexpr uint16_t INPUT_TOKEN_READY = 1U << 2;
+    constexpr uint16_t ALL_STRIPES_READY = (1U << STRIPE_COUNT) - 1U;
+
+    ccu::Variable outputAddr;
+    ccu::Variable outputToken;
+    ccu::Variable inputAddr;
+    ccu::Variable inputToken;
+    ccu::Variable sourceOffset;
+    std::vector<ccu::Variable> stripeOffsets(STRIPE_COUNT);
+    std::vector<ccu::Variable> stripeBytes(STRIPE_COUNT);
+    uint32_t argId = 0;
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(outputAddr, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(outputToken, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(inputAddr, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(inputToken, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(sourceOffset, argId++));
+    for (uint32_t stripe = 0; stripe < STRIPE_COUNT; ++stripe) {
+        CCU_RETURN_IF_ERROR(ccu::LoadArg(stripeOffsets[stripe], argId++));
+        CCU_RETURN_IF_ERROR(ccu::LoadArg(stripeBytes[stripe], argId++));
+    }
+
+    std::vector<ccu::Variable> remoteInputAddr(STRIPE_COUNT);
+    std::vector<ccu::Variable> remoteInputToken(STRIPE_COUNT);
+    for (uint32_t source = 0; source < STRIPE_COUNT; ++source) {
+        remoteInputAddr[source] =
+            ccu::GetResByChannel<ccu::Variable>(kernelArg->channels[source], REMOTE_INPUT_ADDR_ID);
+        remoteInputToken[source] =
+            ccu::GetResByChannel<ccu::Variable>(kernelArg->channels[source], REMOTE_INPUT_TOKEN_ID);
+        CCU_RETURN_IF_ERROR(ccu::WriteVariableWithNotify(kernelArg->channels[source], inputAddr,
+            REMOTE_INPUT_ADDR_ID, CHANNEL_NOTIFY_INDEX, INPUT_ADDR_READY));
+        CCU_RETURN_IF_ERROR(ccu::WriteVariableWithNotify(kernelArg->channels[source], inputToken,
+            REMOTE_INPUT_TOKEN_ID, CHANNEL_NOTIFY_INDEX, INPUT_TOKEN_READY));
+    }
+    for (uint32_t source = 0; source < STRIPE_COUNT; ++source) {
+        CCU_RETURN_IF_ERROR(ccu::NotifyWait(kernelArg->channels[source], CHANNEL_NOTIFY_INDEX,
+            static_cast<uint16_t>(INPUT_ADDR_READY | INPUT_TOKEN_READY)));
+    }
+
+    // Every round uses all eight Clos channels on disjoint output stripes.
+    // Waiting between rounds gives each stripe a fixed cyclic FP32 reduction order.
+    ccu::Event transferEvent;
+    for (uint32_t step = 0; step < STRIPE_COUNT; ++step) {
+        for (uint32_t stripe = 0; stripe < STRIPE_COUNT; ++stripe) {
+            const uint32_t source = (stripe + step) % STRIPE_COUNT;
+            ccu::LocalAddr dst;
+            dst.addr = outputAddr;
+            dst.addr += stripeOffsets[stripe];
+            dst.token = outputToken;
+            ccu::RemoteAddr src;
+            src.addr = remoteInputAddr[source];
+            src.addr += sourceOffset;
+            src.addr += stripeOffsets[stripe];
+            src.token = remoteInputToken[source];
+            const uint16_t mask = static_cast<uint16_t>(1U << stripe);
+            if (step == 0) {
+                CCU_RETURN_IF_ERROR(
+                    ccu::Read(kernelArg->channels[source], dst, src, stripeBytes[stripe], transferEvent, mask));
+            } else {
+                CCU_RETURN_IF_ERROR(ccu::ReadReduce(kernelArg->channels[source], dst, src, stripeBytes[stripe],
+                    kernelArg->dataType, kernelArg->reduceOp, transferEvent, mask));
+            }
+        }
+        CCU_RETURN_IF_ERROR(ccu::EventWait(transferEvent, ALL_STRIPES_READY));
+    }
+    return CCU_SUCCESS;
+}
+
 CcuResult CcuMergePartialKernel(CcuKernelArg arg)
 {
     auto *kernelArg = static_cast<CcuMergePartialKernelArg *>(arg);

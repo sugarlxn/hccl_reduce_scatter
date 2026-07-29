@@ -226,3 +226,101 @@ bank 1：规约 tile k-1
 5. 最后单独优化 512KB 的 NHR/单 kernel 路径。
 
 不建议继续优先调整当前 `tileBytes` 的 1:1 比例或增加 staging bank。v2.4 的结果已经说明，这类局部流水优化无法解决 target 委派、4 卡侧热点和双 Die 串行这三个结构性瓶颈。
+
+
+**结论**
+测试点 11/12 的主要瓶颈已经不是拓扑算法或 tile 大小，而是跨 Server partial 的实现仍产生大量 DRAM staging 和本地树形规约流量。下一版应保留“双 Die 并行 + own-target”，重点把跨机 8 路规约改成分片错峰的并行 `ReadReduce`。
+
+| 用例 | Benchmark | v3.1 | 慢于基准 | 需要降低时延 |
+|---|---:|---:|---:|---:|
+| 2×8 / 512MB | 1.27 ms | 1.78 ms | 40.2% | 28.7% |
+| 2×8 / 400MB+4B | 0.979 ms | 1.40 ms | 43.0% | 30.1% |
+
+v3.0→v3.1 在测试点 11 提升约 4.3%，测试点 12 仅约 0.7%。说明继续消除零散拷贝或微调 8 MiB 双缓冲，很难再得到约 30% 的目标收益。
+
+**当前算法**
+大包在 [reduce_scatter.cc](/home/ubuntu/hccl_reduce_scatter/op_host/reduce_scatter.cc:426) 选择 `DUAL_DIE_PARTIAL`：
+
+- layer-0 kernel：8 个本 Server source，包含本 rank。
+- layer-1 kernel：8 个远端 Server source。
+- 两个 kernel 在两个 CCU thread 上并发执行。
+- 完成后再把两个 partial 做一次本地合并。
+
+每个 rank 的 `recvBytes`：
+
+- 512MB 输入：约 32 MiB。
+- 400MB+4B 输入：约 25 MiB，存在 odd tile/tail 路径。
+
+当前 partial kernel 对每个 8 MiB tile 执行：
+
+1. 所有 source 并行 `Read` 到 output/scratch。
+2. 等待整批 Read 完成。
+3. 在 DRAM 中执行固定树形 `LocalReduce`。
+4. 双 bank 尝试重叠下一 tile 的读取。
+5. 两个 partial 全部完成后，再对完整 `recvBytes` merge。
+
+对应代码在 [ccu_kernel.cc](/home/ubuntu/hccl_reduce_scatter/op_kernel_ccu/ccu_kernel.cc:496) 和 [exec_op.cc](/home/ubuntu/hccl_reduce_scatter/op_host/exec_op.cc:65)。
+
+**关键瓶颈**
+2×8 每个 rank 必须取得另外 15 个 source 的贡献，必要网络流量是：
+
+```text
+layer-0: 7 × recvBytes
+layer-1: 8 × recvBytes
+```
+
+7 条 Full-Mesh 链路可以并行，聚合能力约 `7B`；单个 Clos 接入口约 `4B`。因此理论网络时间大致是：
+
+```text
+layer-0: 7 / 7B ≈ 1
+layer-1: 8 / 4B ≈ 2
+```
+
+跨 Server kernel 才是网络长板。把同 Server peer 迁到 Clos 会进一步增加 Clos 负载，不是优先方向。
+
+更严重的是 DRAM 放大：两个 8-source partial 都要先落盘，再执行各 7 次树形规约，最后还有一次 merge。粗略计算，每 rank 除必要网络数据外，还会产生数十个 `recvBytes` 的 DRAM 读写。v3.1 虽然移除了部分 copy，但核心的“先完整 staging，再 DRAM tree reduce”仍然存在。
+
+**首选优化：分片错峰 ReadReduce**
+将每个 partial 划成 8 个互不重叠的 stripe，按固定轮次安排 source：
+
+```text
+round 0: source (stripe + 0) % 8 -> stripe，使用 Read 初始化
+round 1: source (stripe + 1) % 8 -> stripe，使用 ReadReduce
+...
+round 7: source (stripe + 7) % 8 -> stripe，使用 ReadReduce
+```
+
+同一轮中：
+
+- 8 个 peer 操作不同的目标内存段，可以并发。
+- 不存在多个 peer 同时规约同一地址。
+- 每条 Clos channel 的总通信量不变。
+- 每个 stripe 的 source 顺序固定，满足确定性。
+- 不再需要为每个 source 保存完整 scratch。
+- 不再需要 7 层 DRAM tree reduce。
+
+这正对应赛题提示的 MESH 确定性方案：“不同对端在同一步针对不同内存段做读/写/规约”。
+
+layer-0 也可以采用相同结构：每轮一个 stripe 使用本地贡献，另外 7 个 stripe 使用 7 条 Mesh 链路。建议第一版只替换 layer-1 kernel，保留当前 layer-0 作为稳定基线；确认收益后再统一。
+
+**备选方案**
+1. **CCU Buffer group reduce**
+
+   官方模板会把 4 KiB 微片搬入 CCU buffer，然后调用多输入 `LocalReduce`，参考 [官方 kernel](/home/workspace/hccl/src/ops/reduce_scatter/template/ccu/kernel/ccu_kernel_reduce_scatter_mesh1d_2die_mem2mem.cc:140)。它能避免 DRAM 树形中间结果，风险低于全新算法，但仍保留 staging。
+
+2. **将 8 MiB tile 改为 4 MiB**
+
+   当前 512MB 只有 4 个 full tile，400MB 用例约 3 个 tile 加 tail，流水预热和收尾比例较高。4 MiB 会改善连续流水，但预计只是个位数百分比，不能单独填平 30% 差距。
+
+3. **按 tile 合并 partial**
+
+   当前必须等两个完整 partial kernel 都结束后才 merge。若能按 tile join/merge，可隐藏最后一次完整 local reduce，但需要跨 thread 的细粒度同步，复杂度和 notify 风险较高，应放在后面。
+
+**推荐实施顺序**
+1. 新增 2×8 专用的 layer-1 striped `Read/ReadReduce` partial kernel。
+2. 保持 layer-0、双 thread、最终 merge 不变，先验证功能和性能。
+3. 若测试点 11/12 明显提升，再将 layer-0 改成同样的分片轮转。
+4. 最后比较 striped `ReadReduce` 与官方 4 KiB CCU group-reduce 路径。
+5. tile 调参和 merge 流水只作为收尾优化。
+
+这一轮只做了分析，没有修改源码或编译。

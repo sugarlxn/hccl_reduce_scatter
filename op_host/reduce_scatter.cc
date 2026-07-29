@@ -31,6 +31,7 @@ CcuResult CcuStagingKernel(CcuKernelArg arg);
 CcuResult CcuLocalReduceKernel(CcuKernelArg arg);
 CcuResult CcuCrossReduceKernel(CcuKernelArg arg);
 CcuResult CcuPartialReduceKernel(CcuKernelArg arg);
+CcuResult CcuStripedPartialKernel(CcuKernelArg arg);
 CcuResult CcuMergePartialKernel(CcuKernelArg arg);
 } // namespace ops_hccl
 
@@ -253,11 +254,14 @@ HcclResult RegisterDualDiePartialKernels(HcclComm comm, const OpParam &param, Al
     CcuKernelInfo localInfo{};
     CcuKernelInfo crossInfo{};
     CcuKernelInfo mergeInfo{};
+    const bool useStripedCross = param.rankSize == 16;
     (void)snprintf(localInfo.kernelFuncName, sizeof(localInfo.kernelFuncName), "%s", "CcuPartialReduceKernel");
-    (void)snprintf(crossInfo.kernelFuncName, sizeof(crossInfo.kernelFuncName), "%s", "CcuPartialReduceKernel");
+    (void)snprintf(crossInfo.kernelFuncName, sizeof(crossInfo.kernelFuncName), "%s",
+        useStripedCross ? "CcuStripedPartialKernel" : "CcuPartialReduceKernel");
     (void)snprintf(mergeInfo.kernelFuncName, sizeof(mergeInfo.kernelFuncName), "%s", "CcuMergePartialKernel");
     localInfo.kernelFunc = reinterpret_cast<void *>(ops_hccl::CcuPartialReduceKernel);
-    crossInfo.kernelFunc = reinterpret_cast<void *>(ops_hccl::CcuPartialReduceKernel);
+    crossInfo.kernelFunc = useStripedCross ? reinterpret_cast<void *>(ops_hccl::CcuStripedPartialKernel) :
+                                            reinterpret_cast<void *>(ops_hccl::CcuPartialReduceKernel);
     mergeInfo.kernelFunc = reinterpret_cast<void *>(ops_hccl::CcuMergePartialKernel);
     localInfo.setKernelArg(MakePartialKernelArg(param, localChannels,
         static_cast<uint32_t>(resCtx.localRanks.size()), true, localIndex));
