@@ -916,13 +916,14 @@ CcuResult SyncAndMergePartial(const CcuPartialReduceKernelArg *kernelArg,
     const ccu::Variable &crossPartialAddr, const ccu::Variable &crossPartialToken,
     const ccu::Variable &mergeOffset, const ccu::Variable &mergeBytes)
 {
-    constexpr uint16_t PARTIAL_READY = 1;
+    const uint16_t recordMask = kernelArg->mergeFirstHalf ? 2U : 1U;
+    const uint16_t waitMask = kernelArg->mergeFirstHalf ? 1U : 2U;
     const char *recordTag =
         kernelArg->mergeFirstHalf ? "core0_mission_sync" : "core1_mission_sync";
     const char *waitTag =
         kernelArg->mergeFirstHalf ? "core1_mission_sync" : "core0_mission_sync";
-    CCU_RETURN_IF_ERROR(ccu::EventRecord(recordTag, PARTIAL_READY));
-    CCU_RETURN_IF_ERROR(ccu::EventWait(waitTag, PARTIAL_READY));
+    CCU_RETURN_IF_ERROR(ccu::EventRecord(recordTag, recordMask));
+    CCU_RETURN_IF_ERROR(ccu::EventWait(waitTag, waitMask));
 
     ccu::LocalAddr output;
     output.addr = finalOutputAddr;
