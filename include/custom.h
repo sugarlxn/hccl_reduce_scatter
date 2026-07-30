@@ -75,7 +75,7 @@ enum class ReduceScatterAlgorithm : uint32_t {
     HIERARCHICAL = 2,
     HIERARCHICAL_STAGING = 3,
     DUAL_DIE_PARTIAL = 4,
-    SMALL_CLOS_PARALLEL = 5,
+    STRIPED_SINGLE_DIE = 5,
 };
 
 // ccu kernel register所需信息

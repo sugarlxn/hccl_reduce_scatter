@@ -56,67 +56,49 @@ HcclResult ExecOp(const OpParam &param)
     CHK_RET_CCU(HcommCcuGetMemToken(cclAddr, resCtx.localBuffer.size, &cclToken));
 
     if (resCtx.algorithm == ReduceScatterAlgorithm::DUAL_DIE_PARTIAL ||
-        resCtx.algorithm == ReduceScatterAlgorithm::SMALL_CLOS_PARALLEL) {
+        resCtx.algorithm == ReduceScatterAlgorithm::STRIPED_SINGLE_DIE) {
         const bool dualDie = resCtx.algorithm == ReduceScatterAlgorithm::DUAL_DIE_PARTIAL;
         CHK_PRT_RET(resCtx.ccuKernels.size() != (dualDie ? 3U : 1U) ||
                 resCtx.threads.size() != (dualDie ? 2U : 1U),
             HCCL_ERROR("Incomplete partial-reduce resources"), HCCL_E_INTERNAL);
 
-        constexpr uint64_t PREFERRED_TILE_BYTES = 8 * 1024 * 1024;
-        uint64_t tileCapacity = recvBytes;
         uint64_t localSourceCount = param.rankSize;
         uint64_t crossSourceCount = 0;
-        uint64_t crossPartialAddr = 0;
-        uint64_t crossScratchAddr = 0;
+        const uint64_t crossPartialAddr = cclAddr;
 
         if (dualDie) {
             localSourceCount = resCtx.localRanks.size();
             crossSourceCount = resCtx.crossPeers.size();
             CHK_PRT_RET(localSourceCount == 0 || crossSourceCount == 0,
                 HCCL_ERROR("Invalid dual-die source groups"), HCCL_E_INTERNAL);
-            CHK_PRT_RET(resCtx.localBuffer.size <= recvBytes,
+            CHK_PRT_RET(resCtx.localBuffer.size < recvBytes,
                 HCCL_ERROR("CCL buffer cannot hold the remote partial"), HCCL_E_INTERNAL);
-            const uint64_t scratchSlotCount = 2 * (localSourceCount + crossSourceCount);
-            tileCapacity = std::min<uint64_t>(
-                PREFERRED_TILE_BYTES, (resCtx.localBuffer.size - recvBytes) / scratchSlotCount);
         }
-        tileCapacity = std::min(tileCapacity, recvBytes);
-        tileCapacity = (tileCapacity / dataTypeSize) * dataTypeSize;
-        CHK_PRT_RET(tileCapacity == 0, HCCL_ERROR("CCL buffer is too small for partial reduction"),
-            HCCL_E_INTERNAL);
-
-        const uint64_t localScratchBytes = 2 * localSourceCount * tileCapacity;
-        if (dualDie) {
-            const uint64_t crossScratchBytes = 2 * crossSourceCount * tileCapacity;
-            crossScratchAddr = cclAddr + localScratchBytes;
-            crossPartialAddr = crossScratchAddr + crossScratchBytes;
-            CHK_PRT_RET(crossPartialAddr + recvBytes > cclAddr + resCtx.localBuffer.size,
-                HCCL_ERROR("Partial-reduce scratch exceeds the CCL buffer"), HCCL_E_INTERNAL);
-        } else {
-            CHK_PRT_RET(localScratchBytes > resCtx.localBuffer.size,
-                HCCL_ERROR("Small-message scratch exceeds the CCL buffer"), HCCL_E_INTERNAL);
-        }
-
-        const uint64_t fullTileCount = recvBytes / tileCapacity;
-        const uint64_t pairCount = fullTileCount / 2;
-        const uint64_t pairRepeat = UINT64_MAX - pairCount;
-        const uint64_t hasOddTile = fullTileCount % 2;
-        const uint64_t tailBytes = recvBytes % tileCapacity;
         const uint64_t sourceOffset = param.myRank * recvBytes;
         auto makePartialArgs = [&](uint64_t partialOutputAddr, uint64_t partialOutputToken,
-                                   uint64_t scratchBase, uint64_t sourceCount) {
+                                   uint64_t sourceCount) {
             std::vector<uint64_t> args = {
-                partialOutputAddr, partialOutputToken, inputAddr, inputToken, cclToken, sourceOffset,
-                tileCapacity, pairRepeat, hasOddTile, tailBytes};
-            for (uint64_t bank = 0; bank < 2; ++bank) {
-                for (uint64_t source = 0; source < sourceCount; ++source) {
-                    args.push_back(scratchBase + (bank * sourceCount + source) * tileCapacity);
-                }
+                partialOutputAddr, partialOutputToken, inputAddr, inputToken, sourceOffset};
+            const uint64_t stripeElements = param.count / sourceCount;
+            const uint64_t largeStripeCount = param.count % sourceCount;
+            uint64_t stripeOffset = 0;
+            for (uint64_t stripe = 0; stripe < sourceCount; ++stripe) {
+                const uint64_t stripeBytes =
+                    (stripeElements + (stripe < largeStripeCount ? 1U : 0U)) * dataTypeSize;
+                args.push_back(stripeOffset);
+                args.push_back(stripeBytes);
+                stripeOffset += stripeBytes;
+            }
+            if (stripeOffset != recvBytes) {
+                HCCL_ERROR("Invalid stripe partition");
+                return std::vector<uint64_t>{};
             }
             return args;
         };
         const std::vector<uint64_t> localArgs =
-            makePartialArgs(outputAddr, outputToken, cclAddr, localSourceCount);
+            makePartialArgs(outputAddr, outputToken, localSourceCount);
+        CHK_PRT_RET(localArgs.empty(), HCCL_ERROR("Failed to build local stripe arguments"),
+            HCCL_E_INTERNAL);
 
         if (!dualDie) {
             CHK_RET_CCU(HcommCcuKernelLaunch(resCtx.threads[0], resCtx.ccuKernels[0], localArgs.data(),
@@ -125,7 +107,9 @@ HcclResult ExecOp(const OpParam &param)
         }
 
         const std::vector<uint64_t> crossArgs =
-            makePartialArgs(crossPartialAddr, cclToken, crossScratchAddr, crossSourceCount);
+            makePartialArgs(crossPartialAddr, cclToken, crossSourceCount);
+        CHK_PRT_RET(crossArgs.empty(), HCCL_ERROR("Failed to build cross stripe arguments"),
+            HCCL_E_INTERNAL);
 
         // Main and slave threads target different IO Dies. The pre/post notify
         // pair brackets both launches without serializing their data paths.

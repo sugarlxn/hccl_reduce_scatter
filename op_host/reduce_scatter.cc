@@ -291,7 +291,7 @@ HcclResult RegisterDualDiePartialKernels(HcclComm comm, const OpParam &param, Al
     return HCCL_SUCCESS;
 }
 
-HcclResult RegisterSmallClosParallelKernel(HcclComm comm, const OpParam &param, AlgResourceCtx &resCtx)
+HcclResult RegisterStripedSingleDieKernel(HcclComm comm, const OpParam &param, AlgResourceCtx &resCtx)
 {
     std::vector<ChannelHandle> channels;
     CHK_RET(AcquireMeshChannels(comm, param, channels));
@@ -314,7 +314,7 @@ HcclResult RegisterSmallClosParallelKernel(HcclComm comm, const OpParam &param, 
     CHK_RET_CCU(HcommCcuKernelRegister(insHandle, DIE_ID_AUTO, kernelInfo.kernelFuncName, kernelInfo.kernelFunc,
         kernelArgs, 1, &resCtx.ccuKernels[0]));
     CHK_RET_CCU(HcommCcuKernelRegisterEnd(insHandle));
-    resCtx.algorithm = ReduceScatterAlgorithm::SMALL_CLOS_PARALLEL;
+    resCtx.algorithm = ReduceScatterAlgorithm::STRIPED_SINGLE_DIE;
     return HCCL_SUCCESS;
 }
 
@@ -425,11 +425,10 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
     CHK_PRT_RET(op != HCCL_REDUCE_SUM, HCCL_ERROR("Only sum reduction is supported"), HCCL_E_NOT_SUPPORT);
     const uint64_t inputBytes = recvCount * sizeof(float) * param.rankSize;
     const bool useDualDie = (param.rankSize == 16 || param.rankSize == 12) && inputBytes > SMALL_INPUT_BYTES;
-    const bool useSmallClosParallel =
-        (param.rankSize == 16 || param.rankSize == 12) && inputBytes <= SMALL_INPUT_BYTES;
-    const bool useDirectMesh = param.rankSize == 4 && inputBytes <= SMALL_INPUT_BYTES;
-    const char *algorithmTag = useDualDie ? "dual_die_own_v1" :
-        (useSmallClosParallel ? "small_clos_parallel_v1" : (useDirectMesh ? "direct_v3" : "stage_v3"));
+    const bool useDirectTiny = recvCount < param.rankSize;
+    const bool useStripedSingleDie = !useDualDie && !useDirectTiny;
+    const char *algorithmTag = useDualDie ? "dual_die_striped_v1" :
+        (useDirectTiny ? "direct_tiny_v1" : "striped_single_die_v1");
     (void)snprintf(param.tag, sizeof(param.tag), "hccl_custom_reducescatter_%s", algorithmTag);
 
     // ==============================================
@@ -476,13 +475,12 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
             if (useDualDie) {
                 CHK_RET(BuildOwnTargetPlan(comm, param, resCtxHost));
                 CHK_RET(RegisterDualDiePartialKernels(comm, param, resCtxHost));
-            } else if (useSmallClosParallel) {
-                CHK_RET(RegisterSmallClosParallelKernel(comm, param, resCtxHost));
+            } else if (useStripedSingleDie) {
+                CHK_RET(RegisterStripedSingleDieKernel(comm, param, resCtxHost));
             } else {
                 std::vector<ChannelHandle> channels;
                 CHK_RET(AcquireMeshChannels(comm, param, channels));
-                const auto algorithm = useDirectMesh ? ReduceScatterAlgorithm::DIRECT_MESH :
-                                                       ReduceScatterAlgorithm::STAGING_MESH;
+                const auto algorithm = ReduceScatterAlgorithm::DIRECT_MESH;
                 CHK_RET(RegisterMeshKernel(comm, param, channels, algorithm, resCtxHost));
             }
         }
