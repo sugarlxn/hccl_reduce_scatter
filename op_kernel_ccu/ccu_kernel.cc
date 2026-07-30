@@ -988,7 +988,8 @@ CcuResult CcuGroupReducePartialKernel(CcuKernelArg arg)
     CCU_RETURN_IF_ERROR(ccu::LoadArg(mergeOffset, argId++));
     CCU_RETURN_IF_ERROR(ccu::LoadArg(mergeBytes, argId++));
 
-    std::vector<ccu::RemoteAddr> remoteSources(GROUP_SOURCE_COUNT);
+    std::vector<ccu::Variable> remoteInputAddrs(GROUP_SOURCE_COUNT);
+    std::vector<ccu::Variable> remoteInputTokens(GROUP_SOURCE_COUNT);
     ccu::LocalAddr localSource;
     localSource.addr = inputAddr;
     localSource.addr += sourceOffset;
@@ -996,31 +997,29 @@ CcuResult CcuGroupReducePartialKernel(CcuKernelArg arg)
     uint32_t channel = 0;
     for (uint32_t source = 0; source < GROUP_SOURCE_COUNT; ++source) {
         if (kernelArg->includeLocalSource && source == kernelArg->localSourceIndex) {
-            remoteSources[source].addr = inputAddr;
-            remoteSources[source].addr += sourceOffset;
-            remoteSources[source].token = inputToken;
+            remoteInputAddrs[source] = inputAddr;
+            remoteInputTokens[source] = inputToken;
             continue;
         }
-        ccu::Variable remoteAddr =
+        remoteInputAddrs[source] =
             ccu::GetResByChannel<ccu::Variable>(kernelArg->channels[channel], REMOTE_INPUT_ADDR_ID);
-        ccu::Variable remoteToken =
+        remoteInputTokens[source] =
             ccu::GetResByChannel<ccu::Variable>(kernelArg->channels[channel], REMOTE_INPUT_TOKEN_ID);
         CCU_RETURN_IF_ERROR(ccu::WriteVariableWithNotify(kernelArg->channels[channel], inputAddr,
             REMOTE_INPUT_ADDR_ID, CHANNEL_NOTIFY_INDEX, INPUT_ADDR_READY));
         CCU_RETURN_IF_ERROR(ccu::WriteVariableWithNotify(kernelArg->channels[channel], inputToken,
             REMOTE_INPUT_TOKEN_ID, CHANNEL_NOTIFY_INDEX, INPUT_TOKEN_READY));
-        remoteSources[source].addr = remoteAddr;
-        remoteSources[source].token = remoteToken;
         ++channel;
     }
     for (uint32_t sourceChannel = 0; sourceChannel < kernelArg->channelCount; ++sourceChannel) {
         CCU_RETURN_IF_ERROR(ccu::NotifyWait(kernelArg->channels[sourceChannel], CHANNEL_NOTIFY_INDEX,
             static_cast<uint16_t>(INPUT_ADDR_READY | INPUT_TOKEN_READY)));
     }
+    std::vector<ccu::RemoteAddr> remoteSources(GROUP_SOURCE_COUNT);
     for (uint32_t source = 0; source < GROUP_SOURCE_COUNT; ++source) {
-        if (!kernelArg->includeLocalSource || source != kernelArg->localSourceIndex) {
-            remoteSources[source].addr += sourceOffset;
-        }
+        remoteSources[source].addr = remoteInputAddrs[source];
+        remoteSources[source].addr += sourceOffset;
+        remoteSources[source].token = remoteInputTokens[source];
     }
 
     ccu::LocalAddr output;
