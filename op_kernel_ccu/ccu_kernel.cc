@@ -938,13 +938,6 @@ CcuResult CcuGroupReducePartialKernel(CcuKernelArg arg)
     ccu::Variable loopIterations;
     ccu::Variable parallelParam;
     ccu::Variable tailBytes;
-    ccu::Variable finalOutputAddr;
-    ccu::Variable finalOutputToken;
-    ccu::Variable crossPartialAddr;
-    ccu::Variable crossPartialToken;
-    ccu::Variable mergeOffset;
-    ccu::Variable mergeBytes;
-    ccu::Variable mergePhase;
     uint32_t argId = 0;
     CCU_RETURN_IF_ERROR(ccu::LoadArg(outputAddr, argId++));
     CCU_RETURN_IF_ERROR(ccu::LoadArg(outputToken, argId++));
@@ -955,83 +948,61 @@ CcuResult CcuGroupReducePartialKernel(CcuKernelArg arg)
     CCU_RETURN_IF_ERROR(ccu::LoadArg(loopIterations, argId++));
     CCU_RETURN_IF_ERROR(ccu::LoadArg(parallelParam, argId++));
     CCU_RETURN_IF_ERROR(ccu::LoadArg(tailBytes, argId++));
-    CCU_RETURN_IF_ERROR(ccu::LoadArg(finalOutputAddr, argId++));
-    CCU_RETURN_IF_ERROR(ccu::LoadArg(finalOutputToken, argId++));
-    CCU_RETURN_IF_ERROR(ccu::LoadArg(crossPartialAddr, argId++));
-    CCU_RETURN_IF_ERROR(ccu::LoadArg(crossPartialToken, argId++));
-    CCU_RETURN_IF_ERROR(ccu::LoadArg(mergeOffset, argId++));
-    CCU_RETURN_IF_ERROR(ccu::LoadArg(mergeBytes, argId++));
-    CCU_RETURN_IF_ERROR(ccu::LoadArg(mergePhase, argId++));
-
-    CCU_IF(mergePhase == 0)
-    {
-        std::vector<ccu::Variable> remoteInputAddrs(GROUP_SOURCE_COUNT);
-        std::vector<ccu::Variable> remoteInputTokens(GROUP_SOURCE_COUNT);
-        ccu::LocalAddr localSource;
-        localSource.addr = inputAddr;
-        localSource.addr += sourceOffset;
-        localSource.token = inputToken;
-        uint32_t channel = 0;
-        for (uint32_t source = 0; source < GROUP_SOURCE_COUNT; ++source) {
-            if (kernelArg->includeLocalSource && source == kernelArg->localSourceIndex) {
-                remoteInputAddrs[source] = inputAddr;
-                remoteInputTokens[source] = inputToken;
-                continue;
-            }
-            remoteInputAddrs[source] =
-                ccu::GetResByChannel<ccu::Variable>(kernelArg->channels[channel], REMOTE_INPUT_ADDR_ID);
-            remoteInputTokens[source] =
-                ccu::GetResByChannel<ccu::Variable>(kernelArg->channels[channel], REMOTE_INPUT_TOKEN_ID);
-            CCU_RETURN_IF_ERROR(ccu::WriteVariableWithNotify(kernelArg->channels[channel], inputAddr,
-                REMOTE_INPUT_ADDR_ID, CHANNEL_NOTIFY_INDEX, INPUT_ADDR_READY));
-            CCU_RETURN_IF_ERROR(ccu::WriteVariableWithNotify(kernelArg->channels[channel], inputToken,
-                REMOTE_INPUT_TOKEN_ID, CHANNEL_NOTIFY_INDEX, INPUT_TOKEN_READY));
-            ++channel;
+    std::vector<ccu::Variable> remoteInputAddrs(GROUP_SOURCE_COUNT);
+    std::vector<ccu::Variable> remoteInputTokens(GROUP_SOURCE_COUNT);
+    ccu::LocalAddr localSource;
+    localSource.addr = inputAddr;
+    localSource.addr += sourceOffset;
+    localSource.token = inputToken;
+    uint32_t channel = 0;
+    for (uint32_t source = 0; source < GROUP_SOURCE_COUNT; ++source) {
+        if (kernelArg->includeLocalSource && source == kernelArg->localSourceIndex) {
+            remoteInputAddrs[source] = inputAddr;
+            remoteInputTokens[source] = inputToken;
+            continue;
         }
-        for (uint32_t sourceChannel = 0; sourceChannel < kernelArg->channelCount; ++sourceChannel) {
-            CCU_RETURN_IF_ERROR(ccu::NotifyWait(kernelArg->channels[sourceChannel], CHANNEL_NOTIFY_INDEX,
-                static_cast<uint16_t>(INPUT_ADDR_READY | INPUT_TOKEN_READY)));
-        }
-        std::vector<ccu::RemoteAddr> remoteSources(GROUP_SOURCE_COUNT);
-        for (uint32_t source = 0; source < GROUP_SOURCE_COUNT; ++source) {
-            remoteSources[source].addr = remoteInputAddrs[source];
-            remoteSources[source].addr += sourceOffset;
-            remoteSources[source].token = remoteInputTokens[source];
-        }
-
-        ccu::LocalAddr output;
-        output.addr = outputAddr;
-        output.token = outputToken;
-        GroupReduceContext ctx;
-        CCU_RETURN_IF_ERROR(CreateGroupLoops(ctx, kernelArg, remoteSources, localSource, output));
-        CCU_RETURN_IF_ERROR(RunGroupReduce(
-            ctx, remoteSources, localSource, output, fullBytes, loopIterations, parallelParam, tailBytes));
+        remoteInputAddrs[source] =
+            ccu::GetResByChannel<ccu::Variable>(kernelArg->channels[channel], REMOTE_INPUT_ADDR_ID);
+        remoteInputTokens[source] =
+            ccu::GetResByChannel<ccu::Variable>(kernelArg->channels[channel], REMOTE_INPUT_TOKEN_ID);
+        CCU_RETURN_IF_ERROR(ccu::WriteVariableWithNotify(kernelArg->channels[channel], inputAddr,
+            REMOTE_INPUT_ADDR_ID, CHANNEL_NOTIFY_INDEX, INPUT_ADDR_READY));
+        CCU_RETURN_IF_ERROR(ccu::WriteVariableWithNotify(kernelArg->channels[channel], inputToken,
+            REMOTE_INPUT_TOKEN_ID, CHANNEL_NOTIFY_INDEX, INPUT_TOKEN_READY));
+        ++channel;
+    }
+    for (uint32_t sourceChannel = 0; sourceChannel < kernelArg->channelCount; ++sourceChannel) {
+        CCU_RETURN_IF_ERROR(ccu::NotifyWait(kernelArg->channels[sourceChannel], CHANNEL_NOTIFY_INDEX,
+            static_cast<uint16_t>(INPUT_ADDR_READY | INPUT_TOKEN_READY)));
+    }
+    std::vector<ccu::RemoteAddr> remoteSources(GROUP_SOURCE_COUNT);
+    for (uint32_t source = 0; source < GROUP_SOURCE_COUNT; ++source) {
+        remoteSources[source].addr = remoteInputAddrs[source];
+        remoteSources[source].addr += sourceOffset;
+        remoteSources[source].token = remoteInputTokens[source];
     }
 
-    CCU_IF(mergePhase != 0)
-    {
-        ccu::LocalAddr output;
-        output.addr = finalOutputAddr;
-        output.addr += mergeOffset;
-        output.token = finalOutputToken;
-        ccu::LocalAddr crossPartial;
-        crossPartial.addr = crossPartialAddr;
-        crossPartial.addr += mergeOffset;
-        crossPartial.token = crossPartialToken;
-        ccu::Event reduceEvent;
-        CCU_RETURN_IF_ERROR(ccu::LocalReduce(output, crossPartial, mergeBytes,
-            kernelArg->dataType, kernelArg->reduceOp, reduceEvent));
-        CCU_RETURN_IF_ERROR(ccu::EventWait(reduceEvent));
-    }
-    return CCU_SUCCESS;
+    ccu::LocalAddr output;
+    output.addr = outputAddr;
+    output.token = outputToken;
+    GroupReduceContext ctx;
+    CCU_RETURN_IF_ERROR(CreateGroupLoops(ctx, kernelArg, remoteSources, localSource, output));
+    return RunGroupReduce(
+        ctx, remoteSources, localSource, output, fullBytes, loopIterations, parallelParam, tailBytes);
 }
 
 CcuResult CcuMergePartialKernel(CcuKernelArg arg)
 {
     auto *kernelArg = static_cast<CcuMergePartialKernelArg *>(arg);
-    if (kernelArg == nullptr) {
+    if (kernelArg == nullptr || kernelArg->channelCount > MAX_RANK_SIZE) {
         return CCU_E_PARA;
     }
+
+    constexpr uint32_t REMOTE_ANCHOR_ADDR_ID = 1;
+    constexpr uint32_t REMOTE_ANCHOR_TOKEN_ID = 2;
+    constexpr uint32_t CHANNEL_NOTIFY_INDEX = 0;
+    constexpr uint16_t ANCHOR_ADDR_READY = 1U << 1;
+    constexpr uint16_t ANCHOR_TOKEN_READY = 1U << 2;
 
     ccu::Variable outputAddr;
     ccu::Variable outputToken;
@@ -1044,6 +1015,28 @@ CcuResult CcuMergePartialKernel(CcuKernelArg arg)
     CCU_RETURN_IF_ERROR(ccu::LoadArg(crossPartialAddr, argId++));
     CCU_RETURN_IF_ERROR(ccu::LoadArg(cclToken, argId++));
     CCU_RETURN_IF_ERROR(ccu::LoadArg(recvBytes, argId++));
+
+    if (kernelArg->channelCount != 0) {
+        std::vector<ccu::Variable> remoteAnchorAddrs(kernelArg->channelCount);
+        std::vector<ccu::Variable> remoteAnchorTokens(kernelArg->channelCount);
+        for (uint32_t channel = 0; channel < kernelArg->channelCount; ++channel) {
+            remoteAnchorAddrs[channel] =
+                ccu::GetResByChannel<ccu::Variable>(kernelArg->channels[channel], REMOTE_ANCHOR_ADDR_ID);
+            remoteAnchorTokens[channel] =
+                ccu::GetResByChannel<ccu::Variable>(kernelArg->channels[channel], REMOTE_ANCHOR_TOKEN_ID);
+            CCU_RETURN_IF_ERROR(ccu::WriteVariableWithNotify(kernelArg->channels[channel], outputAddr,
+                REMOTE_ANCHOR_ADDR_ID, CHANNEL_NOTIFY_INDEX, ANCHOR_ADDR_READY));
+            CCU_RETURN_IF_ERROR(ccu::WriteVariableWithNotify(kernelArg->channels[channel], outputToken,
+                REMOTE_ANCHOR_TOKEN_ID, CHANNEL_NOTIFY_INDEX, ANCHOR_TOKEN_READY));
+        }
+        for (uint32_t channel = 0; channel < kernelArg->channelCount; ++channel) {
+            CCU_RETURN_IF_ERROR(ccu::NotifyWait(kernelArg->channels[channel], CHANNEL_NOTIFY_INDEX,
+                static_cast<uint16_t>(ANCHOR_ADDR_READY | ANCHOR_TOKEN_READY)));
+        }
+        ccu::RemoteAddr dieAnchor;
+        dieAnchor.addr = remoteAnchorAddrs[0];
+        dieAnchor.token = remoteAnchorTokens[0];
+    }
 
     ccu::LocalAddr output;
     output.addr = outputAddr;

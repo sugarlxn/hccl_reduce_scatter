@@ -105,7 +105,7 @@ HcclResult ExecOp(const OpParam &param)
         resCtx.algorithm == ReduceScatterAlgorithm::SMALL_CLOS_PARALLEL) {
         const bool dualDie = resCtx.algorithm == ReduceScatterAlgorithm::DUAL_DIE_PARTIAL;
         const bool groupReduce = dualDie && param.rankSize == 16;
-        CHK_PRT_RET(resCtx.ccuKernels.size() != (dualDie ? (groupReduce ? 2U : 3U) : 1U) ||
+        CHK_PRT_RET(resCtx.ccuKernels.size() != (dualDie ? (groupReduce ? 4U : 3U) : 1U) ||
                 resCtx.threads.size() != (dualDie ? 2U : 1U),
             HCCL_ERROR("Incomplete partial-reduce resources"), HCCL_E_INTERNAL);
 
@@ -174,11 +174,6 @@ HcclResult ExecOp(const OpParam &param)
             const std::vector<uint64_t> groupSize = CalcGroupReduceSize(recvBytes);
             localArgs = {outputAddr, outputToken, inputAddr, inputToken, sourceOffset};
             localArgs.insert(localArgs.end(), groupSize.begin(), groupSize.end());
-            const uint64_t firstHalfBytes = (recvBytes / (2 * dataTypeSize)) * dataTypeSize;
-            const std::vector<uint64_t> mergeArgs = {
-                outputAddr, outputToken, crossPartialAddr, cclToken, 0, firstHalfBytes};
-            localArgs.insert(localArgs.end(), mergeArgs.begin(), mergeArgs.end());
-            localArgs.push_back(0);
         } else {
             localArgs = makePartialArgs(outputAddr, outputToken, cclAddr, localSourceCount);
         }
@@ -194,12 +189,6 @@ HcclResult ExecOp(const OpParam &param)
             const std::vector<uint64_t> groupSize = CalcGroupReduceSize(recvBytes);
             crossArgs = {crossPartialAddr, cclToken, inputAddr, inputToken, sourceOffset};
             crossArgs.insert(crossArgs.end(), groupSize.begin(), groupSize.end());
-            const uint64_t firstHalfBytes = (recvBytes / (2 * dataTypeSize)) * dataTypeSize;
-            const std::vector<uint64_t> mergeArgs = {
-                outputAddr, outputToken, crossPartialAddr, cclToken, firstHalfBytes,
-                recvBytes - firstHalfBytes};
-            crossArgs.insert(crossArgs.end(), mergeArgs.begin(), mergeArgs.end());
-            crossArgs.push_back(0);
         } else {
             crossArgs = makePartialArgs(crossPartialAddr, cclToken, crossScratchAddr, crossSourceCount);
         }
@@ -219,13 +208,15 @@ HcclResult ExecOp(const OpParam &param)
         CHK_RET(static_cast<HcclResult>(
             HcommThreadNotifyRecordOnThread(resCtx.threads[1], resCtx.threads[0], 0)));
         if (groupReduce) {
-            std::vector<uint64_t> localMergeArgs = localArgs;
-            std::vector<uint64_t> crossMergeArgs = crossArgs;
-            localMergeArgs.back() = 1;
-            crossMergeArgs.back() = 1;
-            CHK_RET_CCU(HcommCcuKernelLaunch(resCtx.threads[0], resCtx.ccuKernels[0],
+            const uint64_t firstHalfBytes = (recvBytes / (2 * dataTypeSize)) * dataTypeSize;
+            const std::vector<uint64_t> localMergeArgs = {
+                outputAddr, outputToken, crossPartialAddr, cclToken, firstHalfBytes};
+            const std::vector<uint64_t> crossMergeArgs = {
+                outputAddr + firstHalfBytes, outputToken, crossPartialAddr + firstHalfBytes,
+                cclToken, recvBytes - firstHalfBytes};
+            CHK_RET_CCU(HcommCcuKernelLaunch(resCtx.threads[0], resCtx.ccuKernels[2],
                 localMergeArgs.data(), static_cast<uint32_t>(localMergeArgs.size())));
-            CHK_RET_CCU(HcommCcuKernelLaunch(resCtx.threads[1], resCtx.ccuKernels[1],
+            CHK_RET_CCU(HcommCcuKernelLaunch(resCtx.threads[1], resCtx.ccuKernels[3],
                 crossMergeArgs.data(), static_cast<uint32_t>(crossMergeArgs.size())));
             CHK_RET(static_cast<HcclResult>(
                 HcommThreadNotifyWaitOnThreadWithDefaultTimeout(resCtx.threads[0], 1)));
