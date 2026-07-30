@@ -445,7 +445,7 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
         (param.rankSize == 16 || param.rankSize == 12) && inputBytes <= SMALL_INPUT_BYTES;
     const bool useDirectMesh = param.rankSize == 4 && inputBytes <= SMALL_INPUT_BYTES;
     const char *algorithmTag = useDualDie ?
-        (param.rankSize == 16 ? "dual_die_group_oneshot_v5" : "dual_die_own_v1") :
+        (param.rankSize == 16 ? "dual_die_group_twophase_v6" : "dual_die_own_v1") :
         (useSmallClosParallel ? "small_clos_parallel_v1" : (useDirectMesh ? "direct_v3" : "stage_v3"));
     (void)snprintf(param.tag, sizeof(param.tag), "hccl_custom_reducescatter_%s", algorithmTag);
 
@@ -457,8 +457,9 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
     // ==============================================
     // STEP 2.1: 申请用于 Host/Device 同步的通信资源
     // ==============================================
-    // 将用户传入的 stream 转换为 CCU 通信引擎中的 thread，并申请 1 个 notify。
-    const uint32_t threadNotifyNum = 1;
+    // The rank-16 two-phase path uses distinct notifications for the
+    // partial join and the merge join.
+    const uint32_t threadNotifyNum = useDualDie && param.rankSize == 16 ? 2 : 1;
     CHK_RET(HcclThreadAcquireWithStream(comm, ccuEngine, stream, threadNotifyNum, &param.cpuThread));
 
     void *ctx = nullptr;

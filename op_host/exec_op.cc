@@ -178,6 +178,7 @@ HcclResult ExecOp(const OpParam &param)
             const std::vector<uint64_t> mergeArgs = {
                 outputAddr, outputToken, crossPartialAddr, cclToken, 0, firstHalfBytes};
             localArgs.insert(localArgs.end(), mergeArgs.begin(), mergeArgs.end());
+            localArgs.push_back(0);
         } else {
             localArgs = makePartialArgs(outputAddr, outputToken, cclAddr, localSourceCount);
         }
@@ -198,6 +199,7 @@ HcclResult ExecOp(const OpParam &param)
                 outputAddr, outputToken, crossPartialAddr, cclToken, firstHalfBytes,
                 recvBytes - firstHalfBytes};
             crossArgs.insert(crossArgs.end(), mergeArgs.begin(), mergeArgs.end());
+            crossArgs.push_back(0);
         } else {
             crossArgs = makePartialArgs(crossPartialAddr, cclToken, crossScratchAddr, crossSourceCount);
         }
@@ -216,7 +218,20 @@ HcclResult ExecOp(const OpParam &param)
             HcommThreadNotifyWaitOnThreadWithDefaultTimeout(resCtx.threads[0], 0)));
         CHK_RET(static_cast<HcclResult>(
             HcommThreadNotifyRecordOnThread(resCtx.threads[1], resCtx.threads[0], 0)));
-        if (!groupReduce) {
+        if (groupReduce) {
+            std::vector<uint64_t> localMergeArgs = localArgs;
+            std::vector<uint64_t> crossMergeArgs = crossArgs;
+            localMergeArgs.back() = 1;
+            crossMergeArgs.back() = 1;
+            CHK_RET_CCU(HcommCcuKernelLaunch(resCtx.threads[0], resCtx.ccuKernels[0],
+                localMergeArgs.data(), static_cast<uint32_t>(localMergeArgs.size())));
+            CHK_RET_CCU(HcommCcuKernelLaunch(resCtx.threads[1], resCtx.ccuKernels[1],
+                crossMergeArgs.data(), static_cast<uint32_t>(crossMergeArgs.size())));
+            CHK_RET(static_cast<HcclResult>(
+                HcommThreadNotifyWaitOnThreadWithDefaultTimeout(resCtx.threads[0], 1)));
+            CHK_RET(static_cast<HcclResult>(
+                HcommThreadNotifyRecordOnThread(resCtx.threads[1], resCtx.threads[0], 1)));
+        } else {
             const std::vector<uint64_t> mergeArgs = {
                 outputAddr, outputToken, crossPartialAddr, cclToken, recvBytes};
             CHK_RET_CCU(HcommCcuKernelLaunch(resCtx.threads[0], resCtx.ccuKernels[2], mergeArgs.data(),
