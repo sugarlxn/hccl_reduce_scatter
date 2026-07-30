@@ -208,6 +208,13 @@ HcclResult ExecOp(const OpParam &param)
         CHK_RET(static_cast<HcclResult>(
             HcommThreadNotifyRecordOnThread(resCtx.threads[1], resCtx.threads[0], 0)));
         if (groupReduce) {
+            // Complete the two-way partial barrier before either Die starts
+            // merging. Notify 0 is safe to reuse here because both directions
+            // are consumed in strict thread-queue order.
+            CHK_RET(static_cast<HcclResult>(
+                HcommThreadNotifyRecordOnThread(resCtx.threads[0], resCtx.threads[1], 0)));
+            CHK_RET(static_cast<HcclResult>(
+                HcommThreadNotifyWaitOnThreadWithDefaultTimeout(resCtx.threads[1], 0)));
             const uint64_t firstHalfBytes = (recvBytes / (2 * dataTypeSize)) * dataTypeSize;
             const std::vector<uint64_t> localMergeArgs = {
                 outputAddr, outputToken, crossPartialAddr, cclToken, firstHalfBytes};
