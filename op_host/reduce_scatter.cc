@@ -465,7 +465,7 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
         (param.rankSize == 16 || param.rankSize == 12) && inputBytes <= SMALL_INPUT_BYTES;
     const bool useDirectMesh = param.rankSize == 4 && inputBytes <= SMALL_INPUT_BYTES;
     const char *algorithmTag = useDualDie ?
-        (param.rankSize == 16 ? "dual_die_group_splitmerge_v7" : "dual_die_own_v1") :
+        (param.rankSize == 16 ? "dual_die_group_splitmerge_v8" : "dual_die_own_v1") :
         (useSmallClosParallel ? "small_clos_parallel_v1" : (useDirectMesh ? "direct_v3" : "stage_v3"));
     (void)snprintf(param.tag, sizeof(param.tag), "hccl_custom_reducescatter_%s", algorithmTag);
 

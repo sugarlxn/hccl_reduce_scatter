@@ -987,8 +987,12 @@ CcuResult CcuGroupReducePartialKernel(CcuKernelArg arg)
     output.token = outputToken;
     GroupReduceContext ctx;
     CCU_RETURN_IF_ERROR(CreateGroupLoops(ctx, kernelArg, remoteSources, localSource, output));
-    return RunGroupReduce(
-        ctx, remoteSources, localSource, output, fullBytes, loopIterations, parallelParam, tailBytes);
+    CCU_RETURN_IF_ERROR(RunGroupReduce(
+        ctx, remoteSources, localSource, output, fullBytes, loopIterations, parallelParam, tailBytes));
+    ccu::Event kernelDone;
+    CCU_RETURN_IF_ERROR(ccu::EventRecord(kernelDone));
+    CCU_RETURN_IF_ERROR(ccu::EventWait(kernelDone));
+    return CCU_SUCCESS;
 }
 
 CcuResult CcuMergePartialKernel(CcuKernelArg arg)
