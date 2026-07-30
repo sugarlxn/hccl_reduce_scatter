@@ -60,6 +60,8 @@ struct CcuPartialReduceKernelArg : public CcuKernelArgBase {
     uint32_t sourceCount;
     uint32_t localSourceIndex;
     bool includeLocalSource;
+    bool splitMerge;
+    bool mergeFirstHalf;
     HcclDataType dataType;
     HcclReduceOp reduceOp;
 };

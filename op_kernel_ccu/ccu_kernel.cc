@@ -910,6 +910,34 @@ CcuResult RunGroupReduce(GroupReduceContext &ctx,
     }
     return CCU_SUCCESS;
 }
+
+CcuResult SyncAndMergePartial(const CcuPartialReduceKernelArg *kernelArg,
+    const ccu::Variable &finalOutputAddr, const ccu::Variable &finalOutputToken,
+    const ccu::Variable &crossPartialAddr, const ccu::Variable &crossPartialToken,
+    const ccu::Variable &mergeOffset, const ccu::Variable &mergeBytes)
+{
+    constexpr uint16_t PARTIAL_READY = 1;
+    const char *recordTag =
+        kernelArg->mergeFirstHalf ? "core1_mission_sync" : "core0_mission_sync";
+    const char *waitTag =
+        kernelArg->mergeFirstHalf ? "core0_mission_sync" : "core1_mission_sync";
+    CCU_RETURN_IF_ERROR(ccu::EventRecord(recordTag, PARTIAL_READY));
+    CCU_RETURN_IF_ERROR(ccu::EventWait(waitTag, PARTIAL_READY));
+
+    ccu::LocalAddr output;
+    output.addr = finalOutputAddr;
+    output.addr += mergeOffset;
+    output.token = finalOutputToken;
+    ccu::LocalAddr crossPartial;
+    crossPartial.addr = crossPartialAddr;
+    crossPartial.addr += mergeOffset;
+    crossPartial.token = crossPartialToken;
+    ccu::Event reduceEvent;
+    CCU_RETURN_IF_ERROR(ccu::LocalReduce(output, crossPartial, mergeBytes,
+        kernelArg->dataType, kernelArg->reduceOp, reduceEvent));
+    CCU_RETURN_IF_ERROR(ccu::EventWait(reduceEvent));
+    return CCU_SUCCESS;
+}
 } // namespace
 
 CcuResult CcuGroupReducePartialKernel(CcuKernelArg arg)
@@ -917,7 +945,8 @@ CcuResult CcuGroupReducePartialKernel(CcuKernelArg arg)
     auto *kernelArg = static_cast<CcuPartialReduceKernelArg *>(arg);
     if (kernelArg == nullptr || kernelArg->sourceCount != GROUP_SOURCE_COUNT ||
         kernelArg->channelCount != GROUP_SOURCE_COUNT - (kernelArg->includeLocalSource ? 1U : 0U) ||
-        (kernelArg->includeLocalSource && kernelArg->localSourceIndex >= GROUP_SOURCE_COUNT)) {
+        (kernelArg->includeLocalSource && kernelArg->localSourceIndex >= GROUP_SOURCE_COUNT) ||
+        !kernelArg->splitMerge || kernelArg->mergeFirstHalf != kernelArg->includeLocalSource) {
         return CCU_E_PARA;
     }
 
@@ -936,6 +965,12 @@ CcuResult CcuGroupReducePartialKernel(CcuKernelArg arg)
     ccu::Variable loopIterations;
     ccu::Variable parallelParam;
     ccu::Variable tailBytes;
+    ccu::Variable finalOutputAddr;
+    ccu::Variable finalOutputToken;
+    ccu::Variable crossPartialAddr;
+    ccu::Variable crossPartialToken;
+    ccu::Variable mergeOffset;
+    ccu::Variable mergeBytes;
     uint32_t argId = 0;
     CCU_RETURN_IF_ERROR(ccu::LoadArg(outputAddr, argId++));
     CCU_RETURN_IF_ERROR(ccu::LoadArg(outputToken, argId++));
@@ -946,6 +981,12 @@ CcuResult CcuGroupReducePartialKernel(CcuKernelArg arg)
     CCU_RETURN_IF_ERROR(ccu::LoadArg(loopIterations, argId++));
     CCU_RETURN_IF_ERROR(ccu::LoadArg(parallelParam, argId++));
     CCU_RETURN_IF_ERROR(ccu::LoadArg(tailBytes, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(finalOutputAddr, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(finalOutputToken, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(crossPartialAddr, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(crossPartialToken, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(mergeOffset, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(mergeBytes, argId++));
 
     std::vector<ccu::RemoteAddr> remoteSources(GROUP_SOURCE_COUNT);
     ccu::LocalAddr localSource;
@@ -983,24 +1024,17 @@ CcuResult CcuGroupReducePartialKernel(CcuKernelArg arg)
     output.token = outputToken;
     GroupReduceContext ctx;
     CCU_RETURN_IF_ERROR(CreateGroupLoops(ctx, kernelArg, remoteSources, localSource, output));
-    return RunGroupReduce(
-        ctx, remoteSources, localSource, output, fullBytes, loopIterations, parallelParam, tailBytes);
+    CCU_RETURN_IF_ERROR(RunGroupReduce(
+        ctx, remoteSources, localSource, output, fullBytes, loopIterations, parallelParam, tailBytes));
+    return SyncAndMergePartial(kernelArg, finalOutputAddr, finalOutputToken,
+        crossPartialAddr, crossPartialToken, mergeOffset, mergeBytes);
 }
 
 CcuResult CcuMergePartialKernel(CcuKernelArg arg)
 {
     auto *kernelArg = static_cast<CcuMergePartialKernelArg *>(arg);
-    if (kernelArg == nullptr || kernelArg->channelCount > 1) {
+    if (kernelArg == nullptr) {
         return CCU_E_PARA;
-    }
-
-    // A representative channel anchors this otherwise local-only kernel to
-    // the same IO Die as the corresponding partial-reduce kernel.
-    if (kernelArg->channelCount == 1) {
-        constexpr uint32_t DIE_ANCHOR_RESOURCE_ID = 1;
-        auto dieAnchor =
-            ccu::GetResByChannel<ccu::Variable>(kernelArg->channels[0], DIE_ANCHOR_RESOURCE_ID);
-        (void)dieAnchor;
     }
 
     ccu::Variable outputAddr;
