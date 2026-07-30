@@ -10,6 +10,8 @@
 
 #include <hcomm/hcomm_primitives.h>
 
+#include <array>
+#include <memory>
 #include <vector>
 
 #include "custom.h"
@@ -731,11 +733,274 @@ CcuResult CcuPartialReduceKernel(CcuKernelArg arg)
     return CCU_SUCCESS;
 }
 
+namespace {
+constexpr uint32_t GROUP_SOURCE_COUNT = 8;
+constexpr uint32_t GROUP_PARALLEL_COUNT = 16;
+constexpr uint32_t GROUP_MICRO_BYTES = 4096;
+constexpr uint32_t GROUP_BUFFER_STRIDE = GROUP_SOURCE_COUNT;
+
+constexpr uint64_t GroupMaskThrough(uint16_t end)
+{
+    return (uint64_t{1} << (end + 1)) - 1;
+}
+
+uint64_t PackGroupLoopParam(uint64_t loopContext, uint64_t addressOffset, uint64_t iterations)
+{
+    constexpr uint16_t CONTEXT_BITS = 8;
+    constexpr uint16_t CONTEXT_SHIFT = 45;
+    constexpr uint16_t ADDRESS_BITS = 32;
+    constexpr uint16_t ADDRESS_SHIFT = 13;
+    constexpr uint16_t ITERATION_BITS = 13;
+    return ((loopContext & GroupMaskThrough(CONTEXT_BITS)) << CONTEXT_SHIFT) |
+        ((addressOffset & GroupMaskThrough(ADDRESS_BITS)) << ADDRESS_SHIFT) |
+        (iterations & GroupMaskThrough(ITERATION_BITS));
+}
+
+uint64_t PackGroupParallelParam(uint64_t repeatNum, uint64_t repeatLoopIndex, uint64_t totalLoopNum)
+{
+    constexpr uint16_t REPEAT_BITS = 7;
+    constexpr uint16_t REPEAT_SHIFT = 55;
+    constexpr uint16_t LOOP_INDEX_BITS = 7;
+    constexpr uint16_t LOOP_INDEX_SHIFT = 48;
+    constexpr uint16_t LOOP_COUNT_BITS = 7;
+    constexpr uint16_t LOOP_COUNT_SHIFT = 41;
+    return ((repeatNum & GroupMaskThrough(REPEAT_BITS)) << REPEAT_SHIFT) |
+        ((repeatLoopIndex & GroupMaskThrough(LOOP_INDEX_BITS)) << LOOP_INDEX_SHIFT) |
+        ((totalLoopNum & GroupMaskThrough(LOOP_COUNT_BITS)) << LOOP_COUNT_SHIFT);
+}
+
+uint64_t PackGroupOffsetParam(uint64_t addressOffset, uint64_t bufferOffset, uint64_t eventOffset)
+{
+    constexpr uint16_t ADDRESS_BITS = 32;
+    constexpr uint16_t ADDRESS_SHIFT = 21;
+    constexpr uint16_t BUFFER_BITS = 11;
+    constexpr uint16_t BUFFER_SHIFT = 10;
+    constexpr uint16_t EVENT_BITS = 10;
+    return ((addressOffset & GroupMaskThrough(ADDRESS_BITS)) << ADDRESS_SHIFT) |
+        ((bufferOffset & GroupMaskThrough(BUFFER_BITS)) << BUFFER_SHIFT) |
+        (eventOffset & GroupMaskThrough(EVENT_BITS));
+}
+
+struct GroupReduceContext {
+    ccu::Array<ccu::Event> completedEvents{0};
+    ccu::Array<ccu::CcuBuffer> buffers{0};
+    std::array<std::unique_ptr<ccu::Func>, 2> bodies;
+    std::array<std::unique_ptr<ccu::Loop>, 2> loops;
+    std::array<ccu::Variable, 2> loopParams;
+    std::array<ccu::LocalAddr, 2> destinations;
+    std::array<ccu::LocalAddr, 2> localSources;
+    std::array<std::vector<ccu::RemoteAddr>, 2> remoteSources;
+    std::array<ccu::Variable, 2> lengths;
+};
+
+CcuResult CreateGroupLoops(GroupReduceContext &ctx, const CcuPartialReduceKernelArg *kernelArg,
+    const std::vector<ccu::RemoteAddr> &remoteSources, const ccu::LocalAddr &localSource,
+    const ccu::LocalAddr &output)
+{
+    ctx.completedEvents = ccu::Array<ccu::Event>(GROUP_PARALLEL_COUNT);
+    ctx.buffers = ccu::Array<ccu::CcuBuffer>(GROUP_PARALLEL_COUNT * GROUP_BUFFER_STRIDE);
+    for (uint32_t index = 0; index < 2; ++index) {
+        ctx.remoteSources[index].resize(GROUP_SOURCE_COUNT);
+        for (uint32_t source = 0; source < GROUP_SOURCE_COUNT; ++source) {
+            ctx.remoteSources[index][source].addr = remoteSources[source].addr;
+            ctx.remoteSources[index][source].token = remoteSources[source].token;
+        }
+        ctx.localSources[index].addr = localSource.addr;
+        ctx.localSources[index].token = localSource.token;
+        ctx.destinations[index].addr = output.addr;
+        ctx.destinations[index].token = output.token;
+        ctx.lengths[index] = GROUP_MICRO_BYTES;
+        ctx.loopParams[index] = PackGroupLoopParam(0, 0, 1);
+
+        const uint32_t bufferBase = index * GROUP_BUFFER_STRIDE;
+        ccu::Event event = ctx.completedEvents[index];
+        ctx.bodies[index].reset(new ccu::Func(
+            [&ctx, kernelArg, index, bufferBase, event]() {
+                for (uint32_t source = 0; source < GROUP_SOURCE_COUNT; ++source) {
+                    const uint16_t mask = static_cast<uint16_t>(1U << source);
+                    if (kernelArg->includeLocalSource && source == kernelArg->localSourceIndex) {
+                        ccu::LocalCopy(ctx.buffers[bufferBase + source], ctx.localSources[index],
+                            ctx.lengths[index], event, mask);
+                    } else {
+                        const uint32_t channel =
+                            kernelArg->includeLocalSource && source > kernelArg->localSourceIndex ?
+                            source - 1 : source;
+                        ccu::Read(kernelArg->channels[channel], ctx.buffers[bufferBase + source],
+                            ctx.remoteSources[index][source], ctx.lengths[index], event, mask);
+                    }
+                }
+                ccu::EventWait(event, (1U << GROUP_SOURCE_COUNT) - 1U);
+                ccu::LocalReduce(&ctx.buffers[bufferBase], GROUP_SOURCE_COUNT, kernelArg->dataType,
+                    kernelArg->dataType, kernelArg->reduceOp, ctx.lengths[index], event, 1);
+                ccu::EventWait(event, 1);
+                ccu::LocalCopy(ctx.destinations[index], ctx.buffers[bufferBase],
+                    ctx.lengths[index], event, 1);
+                ccu::EventWait(event, 1);
+            }));
+        ctx.loops[index].reset(new ccu::Loop(ctx.loopParams[index], *ctx.bodies[index]));
+    }
+    return CCU_SUCCESS;
+}
+
+CcuResult RunGroupReduce(GroupReduceContext &ctx,
+    const std::vector<ccu::RemoteAddr> &remoteSources, const ccu::LocalAddr &localSource,
+    const ccu::LocalAddr &output, ccu::Variable &fullBytes, ccu::Variable &loopIterations,
+    ccu::Variable &parallelParam, ccu::Variable &tailBytes)
+{
+    CCU_IF(loopIterations != 0)
+    {
+        for (uint32_t source = 0; source < GROUP_SOURCE_COUNT; ++source) {
+            ctx.remoteSources[0][source].addr = remoteSources[source].addr;
+            ctx.remoteSources[0][source].token = remoteSources[source].token;
+        }
+        ctx.localSources[0].addr = localSource.addr;
+        ctx.localSources[0].token = localSource.token;
+        ctx.destinations[0].addr = output.addr;
+        ctx.destinations[0].token = output.token;
+        ctx.lengths[0] = GROUP_MICRO_BYTES;
+        ccu::Variable loopParam;
+        loopParam = PackGroupLoopParam(0, GROUP_MICRO_BYTES * GROUP_PARALLEL_COUNT, 0);
+        loopParam += loopIterations;
+        ctx.loopParams[0] = loopParam;
+        ccu::Variable repeat;
+        repeat = PackGroupParallelParam(GROUP_PARALLEL_COUNT - 1, 0, 1);
+        ccu::Variable offset;
+        offset = PackGroupOffsetParam(GROUP_MICRO_BYTES, GROUP_BUFFER_STRIDE, 1);
+        std::vector<ccu::Loop> loops{*ctx.loops[0]};
+        ccu::LoopGroup group(repeat, offset, GROUP_PARALLEL_COUNT, loops);
+    }
+
+    CCU_IF(parallelParam != 0)
+    {
+        std::vector<ccu::RemoteAddr> sources = remoteSources;
+        ccu::LocalAddr local = localSource;
+        ccu::LocalAddr destination = output;
+        for (uint32_t source = 0; source < GROUP_SOURCE_COUNT; ++source) {
+            sources[source].addr += fullBytes;
+            ctx.remoteSources[0][source].addr = sources[source].addr;
+            ctx.remoteSources[0][source].token = sources[source].token;
+        }
+        local.addr += fullBytes;
+        ctx.localSources[0].addr = local.addr;
+        ctx.localSources[0].token = local.token;
+        destination.addr += fullBytes;
+        ctx.destinations[0].addr = destination.addr;
+        ctx.destinations[0].token = destination.token;
+        ctx.lengths[0] = tailBytes;
+
+        for (uint32_t source = 0; source < GROUP_SOURCE_COUNT; ++source) {
+            sources[source].addr += tailBytes;
+            ctx.remoteSources[1][source].addr = sources[source].addr;
+            ctx.remoteSources[1][source].token = sources[source].token;
+        }
+        local.addr += tailBytes;
+        ctx.localSources[1].addr = local.addr;
+        ctx.localSources[1].token = local.token;
+        destination.addr += tailBytes;
+        ctx.destinations[1].addr = destination.addr;
+        ctx.destinations[1].token = destination.token;
+        ctx.lengths[1] = GROUP_MICRO_BYTES;
+
+        ctx.loopParams[0] = PackGroupLoopParam(0, 0, 1);
+        ctx.loopParams[1] = PackGroupLoopParam(0, 0, 1);
+        ccu::Variable offset;
+        offset = PackGroupOffsetParam(GROUP_MICRO_BYTES, GROUP_BUFFER_STRIDE, 1);
+        std::vector<ccu::Loop> loops{*ctx.loops[0], *ctx.loops[1]};
+        ccu::LoopGroup group(parallelParam, offset, GROUP_PARALLEL_COUNT, loops);
+    }
+    return CCU_SUCCESS;
+}
+} // namespace
+
+CcuResult CcuGroupReducePartialKernel(CcuKernelArg arg)
+{
+    auto *kernelArg = static_cast<CcuPartialReduceKernelArg *>(arg);
+    if (kernelArg == nullptr || kernelArg->sourceCount != GROUP_SOURCE_COUNT ||
+        kernelArg->channelCount != GROUP_SOURCE_COUNT - (kernelArg->includeLocalSource ? 1U : 0U) ||
+        (kernelArg->includeLocalSource && kernelArg->localSourceIndex >= GROUP_SOURCE_COUNT)) {
+        return CCU_E_PARA;
+    }
+
+    constexpr uint32_t REMOTE_INPUT_ADDR_ID = 1;
+    constexpr uint32_t REMOTE_INPUT_TOKEN_ID = 2;
+    constexpr uint32_t CHANNEL_NOTIFY_INDEX = 0;
+    constexpr uint16_t INPUT_ADDR_READY = 1U << 1;
+    constexpr uint16_t INPUT_TOKEN_READY = 1U << 2;
+
+    ccu::Variable outputAddr;
+    ccu::Variable outputToken;
+    ccu::Variable inputAddr;
+    ccu::Variable inputToken;
+    ccu::Variable sourceOffset;
+    ccu::Variable fullBytes;
+    ccu::Variable loopIterations;
+    ccu::Variable parallelParam;
+    ccu::Variable tailBytes;
+    uint32_t argId = 0;
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(outputAddr, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(outputToken, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(inputAddr, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(inputToken, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(sourceOffset, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(fullBytes, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(loopIterations, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(parallelParam, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(tailBytes, argId++));
+
+    std::vector<ccu::RemoteAddr> remoteSources(GROUP_SOURCE_COUNT);
+    ccu::LocalAddr localSource;
+    localSource.addr = inputAddr;
+    localSource.addr += sourceOffset;
+    localSource.token = inputToken;
+    uint32_t channel = 0;
+    for (uint32_t source = 0; source < GROUP_SOURCE_COUNT; ++source) {
+        if (kernelArg->includeLocalSource && source == kernelArg->localSourceIndex) {
+            remoteSources[source].addr = inputAddr;
+            remoteSources[source].addr += sourceOffset;
+            remoteSources[source].token = inputToken;
+            continue;
+        }
+        ccu::Variable remoteAddr =
+            ccu::GetResByChannel<ccu::Variable>(kernelArg->channels[channel], REMOTE_INPUT_ADDR_ID);
+        ccu::Variable remoteToken =
+            ccu::GetResByChannel<ccu::Variable>(kernelArg->channels[channel], REMOTE_INPUT_TOKEN_ID);
+        CCU_RETURN_IF_ERROR(ccu::WriteVariableWithNotify(kernelArg->channels[channel], inputAddr,
+            REMOTE_INPUT_ADDR_ID, CHANNEL_NOTIFY_INDEX, INPUT_ADDR_READY));
+        CCU_RETURN_IF_ERROR(ccu::WriteVariableWithNotify(kernelArg->channels[channel], inputToken,
+            REMOTE_INPUT_TOKEN_ID, CHANNEL_NOTIFY_INDEX, INPUT_TOKEN_READY));
+        remoteSources[source].addr = remoteAddr;
+        remoteSources[source].addr += sourceOffset;
+        remoteSources[source].token = remoteToken;
+        ++channel;
+    }
+    for (uint32_t sourceChannel = 0; sourceChannel < kernelArg->channelCount; ++sourceChannel) {
+        CCU_RETURN_IF_ERROR(ccu::NotifyWait(kernelArg->channels[sourceChannel], CHANNEL_NOTIFY_INDEX,
+            static_cast<uint16_t>(INPUT_ADDR_READY | INPUT_TOKEN_READY)));
+    }
+
+    ccu::LocalAddr output;
+    output.addr = outputAddr;
+    output.token = outputToken;
+    GroupReduceContext ctx;
+    CCU_RETURN_IF_ERROR(CreateGroupLoops(ctx, kernelArg, remoteSources, localSource, output));
+    return RunGroupReduce(
+        ctx, remoteSources, localSource, output, fullBytes, loopIterations, parallelParam, tailBytes);
+}
+
 CcuResult CcuMergePartialKernel(CcuKernelArg arg)
 {
     auto *kernelArg = static_cast<CcuMergePartialKernelArg *>(arg);
-    if (kernelArg == nullptr) {
+    if (kernelArg == nullptr || kernelArg->channelCount > 1) {
         return CCU_E_PARA;
+    }
+
+    // A representative channel anchors this otherwise local-only kernel to
+    // the same IO Die as the corresponding partial-reduce kernel.
+    if (kernelArg->channelCount == 1) {
+        constexpr uint32_t DIE_ANCHOR_RESOURCE_ID = 1;
+        auto dieAnchor =
+            ccu::GetResByChannel<ccu::Variable>(kernelArg->channels[0], DIE_ANCHOR_RESOURCE_ID);
+        (void)dieAnchor;
     }
 
     ccu::Variable outputAddr;
