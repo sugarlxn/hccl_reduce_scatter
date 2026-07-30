@@ -918,9 +918,9 @@ CcuResult SyncAndMergePartial(const CcuPartialReduceKernelArg *kernelArg,
 {
     constexpr uint16_t PARTIAL_READY = 1;
     const char *recordTag =
-        kernelArg->mergeFirstHalf ? "core1_mission_sync" : "core0_mission_sync";
-    const char *waitTag =
         kernelArg->mergeFirstHalf ? "core0_mission_sync" : "core1_mission_sync";
+    const char *waitTag =
+        kernelArg->mergeFirstHalf ? "core1_mission_sync" : "core0_mission_sync";
     CCU_RETURN_IF_ERROR(ccu::EventRecord(recordTag, PARTIAL_READY));
     CCU_RETURN_IF_ERROR(ccu::EventWait(waitTag, PARTIAL_READY));
 
@@ -1010,13 +1010,17 @@ CcuResult CcuGroupReducePartialKernel(CcuKernelArg arg)
         CCU_RETURN_IF_ERROR(ccu::WriteVariableWithNotify(kernelArg->channels[channel], inputToken,
             REMOTE_INPUT_TOKEN_ID, CHANNEL_NOTIFY_INDEX, INPUT_TOKEN_READY));
         remoteSources[source].addr = remoteAddr;
-        remoteSources[source].addr += sourceOffset;
         remoteSources[source].token = remoteToken;
         ++channel;
     }
     for (uint32_t sourceChannel = 0; sourceChannel < kernelArg->channelCount; ++sourceChannel) {
         CCU_RETURN_IF_ERROR(ccu::NotifyWait(kernelArg->channels[sourceChannel], CHANNEL_NOTIFY_INDEX,
             static_cast<uint16_t>(INPUT_ADDR_READY | INPUT_TOKEN_READY)));
+    }
+    for (uint32_t source = 0; source < GROUP_SOURCE_COUNT; ++source) {
+        if (!kernelArg->includeLocalSource || source != kernelArg->localSourceIndex) {
+            remoteSources[source].addr += sourceOffset;
+        }
     }
 
     ccu::LocalAddr output;
