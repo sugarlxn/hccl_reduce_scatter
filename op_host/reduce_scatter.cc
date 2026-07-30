@@ -218,11 +218,12 @@ HcclResult BuildOwnTargetPlan(HcclComm comm, const OpParam &param, AlgResourceCt
 }
 
 std::shared_ptr<CcuPartialReduceKernelArg> MakePartialKernelArg(const OpParam &param,
-    const std::vector<ChannelHandle> &channels, uint32_t sourceCount, bool includeLocalSource,
-    uint32_t localSourceIndex)
+    const std::vector<ChannelHandle> &channels, uint32_t sourceCount, uint32_t stripeCount,
+    bool includeLocalSource, uint32_t localSourceIndex)
 {
     auto kernelArg = std::make_shared<CcuPartialReduceKernelArg>();
     kernelArg->sourceCount = sourceCount;
+    kernelArg->stripeCount = stripeCount;
     kernelArg->localSourceIndex = localSourceIndex;
     kernelArg->includeLocalSource = includeLocalSource;
     kernelArg->dataType = param.dataType;
@@ -259,10 +260,12 @@ HcclResult RegisterDualDiePartialKernels(HcclComm comm, const OpParam &param, Al
     localInfo.kernelFunc = reinterpret_cast<void *>(ops_hccl::CcuPartialReduceKernel);
     crossInfo.kernelFunc = reinterpret_cast<void *>(ops_hccl::CcuPartialReduceKernel);
     mergeInfo.kernelFunc = reinterpret_cast<void *>(ops_hccl::CcuMergePartialKernel);
-    localInfo.setKernelArg(MakePartialKernelArg(param, localChannels,
-        static_cast<uint32_t>(resCtx.localRanks.size()), true, localIndex));
-    crossInfo.setKernelArg(MakePartialKernelArg(param, crossChannels,
-        static_cast<uint32_t>(resCtx.crossPeers.size()), false, 0));
+    const uint32_t localSourceCount = static_cast<uint32_t>(resCtx.localRanks.size());
+    const uint32_t crossSourceCount = static_cast<uint32_t>(resCtx.crossPeers.size());
+    localInfo.setKernelArg(MakePartialKernelArg(
+        param, localChannels, localSourceCount, localSourceCount, true, localIndex));
+    crossInfo.setKernelArg(MakePartialKernelArg(
+        param, crossChannels, crossSourceCount, crossSourceCount, false, 0));
     auto mergeKernelArg = std::make_shared<CcuMergePartialKernelArg>();
     mergeKernelArg->dataType = param.dataType;
     mergeKernelArg->reduceOp = param.reduceType;
@@ -299,8 +302,9 @@ HcclResult RegisterStripedSingleDieKernel(HcclComm comm, const OpParam &param, A
     CcuKernelInfo kernelInfo{};
     (void)snprintf(kernelInfo.kernelFuncName, sizeof(kernelInfo.kernelFuncName), "%s", "CcuPartialReduceKernel");
     kernelInfo.kernelFunc = reinterpret_cast<void *>(ops_hccl::CcuPartialReduceKernel);
+    const uint32_t stripeCount = std::min(param.rankSize, MAX_SINGLE_DIE_STRIPES);
     kernelInfo.setKernelArg(MakePartialKernelArg(
-        param, channels, param.rankSize, true, param.myRank));
+        param, channels, param.rankSize, stripeCount, true, param.myRank));
 
     CcuInsHandle insHandle = 0;
     uint32_t insNum = 0;
@@ -427,8 +431,8 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
     const bool useDualDie = (param.rankSize == 16 || param.rankSize == 12) && inputBytes > SMALL_INPUT_BYTES;
     const bool useDirectTiny = recvCount < param.rankSize;
     const bool useStripedSingleDie = !useDualDie && !useDirectTiny;
-    const char *algorithmTag = useDualDie ? "dual_die_striped_v1" :
-        (useDirectTiny ? "direct_tiny_v1" : "striped_single_die_v1");
+    const char *algorithmTag = useDualDie ? "dual_die_striped_v2" :
+        (useDirectTiny ? "direct_tiny_v1" : "striped_single_die_v2");
     (void)snprintf(param.tag, sizeof(param.tag), "hccl_custom_reducescatter_%s", algorithmTag);
 
     // ==============================================

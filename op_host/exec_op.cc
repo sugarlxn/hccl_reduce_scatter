@@ -76,13 +76,13 @@ HcclResult ExecOp(const OpParam &param)
         }
         const uint64_t sourceOffset = param.myRank * recvBytes;
         auto makePartialArgs = [&](uint64_t partialOutputAddr, uint64_t partialOutputToken,
-                                   uint64_t sourceCount) {
+                                   uint64_t stripeCount) {
             std::vector<uint64_t> args = {
                 partialOutputAddr, partialOutputToken, inputAddr, inputToken, sourceOffset};
-            const uint64_t stripeElements = param.count / sourceCount;
-            const uint64_t largeStripeCount = param.count % sourceCount;
+            const uint64_t stripeElements = param.count / stripeCount;
+            const uint64_t largeStripeCount = param.count % stripeCount;
             uint64_t stripeOffset = 0;
-            for (uint64_t stripe = 0; stripe < sourceCount; ++stripe) {
+            for (uint64_t stripe = 0; stripe < stripeCount; ++stripe) {
                 const uint64_t stripeBytes =
                     (stripeElements + (stripe < largeStripeCount ? 1U : 0U)) * dataTypeSize;
                 args.push_back(stripeOffset);
@@ -95,8 +95,10 @@ HcclResult ExecOp(const OpParam &param)
             }
             return args;
         };
+        const uint64_t localStripeCount =
+            dualDie ? localSourceCount : std::min<uint64_t>(localSourceCount, MAX_SINGLE_DIE_STRIPES);
         const std::vector<uint64_t> localArgs =
-            makePartialArgs(outputAddr, outputToken, localSourceCount);
+            makePartialArgs(outputAddr, outputToken, localStripeCount);
         CHK_PRT_RET(localArgs.empty(), HCCL_ERROR("Failed to build local stripe arguments"),
             HCCL_E_INTERNAL);
 

@@ -497,6 +497,7 @@ CcuResult CcuPartialReduceKernel(CcuKernelArg arg)
 {
     auto *kernelArg = static_cast<CcuPartialReduceKernelArg *>(arg);
     if (kernelArg == nullptr || kernelArg->sourceCount == 0 || kernelArg->sourceCount > MAX_RANK_SIZE ||
+        kernelArg->stripeCount == 0 || kernelArg->stripeCount > kernelArg->sourceCount ||
         kernelArg->channelCount != kernelArg->sourceCount - (kernelArg->includeLocalSource ? 1U : 0U) ||
         (kernelArg->includeLocalSource && kernelArg->localSourceIndex >= kernelArg->sourceCount)) {
         return CCU_E_PARA;
@@ -513,15 +514,15 @@ CcuResult CcuPartialReduceKernel(CcuKernelArg arg)
     ccu::Variable inputAddr;
     ccu::Variable inputToken;
     ccu::Variable sourceOffset;
-    std::vector<ccu::Variable> stripeOffsets(kernelArg->sourceCount);
-    std::vector<ccu::Variable> stripeBytes(kernelArg->sourceCount);
+    std::vector<ccu::Variable> stripeOffsets(kernelArg->stripeCount);
+    std::vector<ccu::Variable> stripeBytes(kernelArg->stripeCount);
     uint32_t argId = 0;
     CCU_RETURN_IF_ERROR(ccu::LoadArg(outputAddr, argId++));
     CCU_RETURN_IF_ERROR(ccu::LoadArg(outputToken, argId++));
     CCU_RETURN_IF_ERROR(ccu::LoadArg(inputAddr, argId++));
     CCU_RETURN_IF_ERROR(ccu::LoadArg(inputToken, argId++));
     CCU_RETURN_IF_ERROR(ccu::LoadArg(sourceOffset, argId++));
-    for (uint32_t stripe = 0; stripe < kernelArg->sourceCount; ++stripe) {
+    for (uint32_t stripe = 0; stripe < kernelArg->stripeCount; ++stripe) {
         CCU_RETURN_IF_ERROR(ccu::LoadArg(stripeOffsets[stripe], argId++));
         CCU_RETURN_IF_ERROR(ccu::LoadArg(stripeBytes[stripe], argId++));
     }
@@ -550,16 +551,16 @@ CcuResult CcuPartialReduceKernel(CcuKernelArg arg)
             static_cast<uint16_t>(INPUT_ADDR_READY | INPUT_TOKEN_READY)));
     }
 
-    // Split the partial into sourceCount independent stripes. In every round,
-    // (stripe + round) % sourceCount is a permutation of the sources, so each
-    // channel is used at most once and every operation writes a disjoint range.
-    // Each stripe consumes sources in a fixed cyclic order, preserving
-    // deterministic FP32 accumulation without staging remote data in HBM.
+    // Split the partial into independent stripes. In every round,
+    // (stripe + round) % sourceCount selects distinct sources, so each channel
+    // is used at most once and every operation writes a disjoint range. Across
+    // sourceCount rounds every stripe consumes every source in a fixed cyclic
+    // order, preserving deterministic FP32 accumulation without HBM staging.
     ccu::Event stripeEvent;
     const uint16_t allStripesMask = static_cast<uint16_t>(
-        kernelArg->sourceCount == 16 ? 0xFFFFU : ((1U << kernelArg->sourceCount) - 1U));
+        kernelArg->stripeCount == 16 ? 0xFFFFU : ((1U << kernelArg->stripeCount) - 1U));
     for (uint32_t round = 0; round < kernelArg->sourceCount; ++round) {
-        for (uint32_t stripe = 0; stripe < kernelArg->sourceCount; ++stripe) {
+        for (uint32_t stripe = 0; stripe < kernelArg->stripeCount; ++stripe) {
             const uint32_t source = (stripe + round) % kernelArg->sourceCount;
             const uint16_t mask = static_cast<uint16_t>(1U << stripe);
 

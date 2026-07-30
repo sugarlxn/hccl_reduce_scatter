@@ -39,6 +39,7 @@ struct CcuReduceScatterKernelArg : public CcuKernelArgBase {
 constexpr uint32_t MAX_LOCAL_RANK_SIZE = 8;
 constexpr uint32_t MAX_HIERARCHICAL_TARGETS = 3;
 constexpr uint32_t MAX_CROSS_PEERS = 2;
+constexpr uint32_t MAX_SINGLE_DIE_STRIPES = 4;
 
 struct CcuLocalReduceKernelArg : public CcuKernelArgBase {
     uint32_t groupSize;
@@ -58,6 +59,7 @@ struct CcuCrossReduceKernelArg : public CcuKernelArgBase {
 
 struct CcuPartialReduceKernelArg : public CcuKernelArgBase {
     uint32_t sourceCount;
+    uint32_t stripeCount;
     uint32_t localSourceIndex;
     bool includeLocalSource;
     HcclDataType dataType;
