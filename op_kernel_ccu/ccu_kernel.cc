@@ -998,15 +998,9 @@ CcuResult CcuGroupReducePartialKernel(CcuKernelArg arg)
 CcuResult CcuMergePartialKernel(CcuKernelArg arg)
 {
     auto *kernelArg = static_cast<CcuMergePartialKernelArg *>(arg);
-    if (kernelArg == nullptr || kernelArg->channelCount > MAX_RANK_SIZE) {
+    if (kernelArg == nullptr) {
         return CCU_E_PARA;
     }
-
-    constexpr uint32_t REMOTE_ANCHOR_ADDR_ID = 1;
-    constexpr uint32_t REMOTE_ANCHOR_TOKEN_ID = 2;
-    constexpr uint32_t CHANNEL_NOTIFY_INDEX = 0;
-    constexpr uint16_t ANCHOR_ADDR_READY = 1U << 1;
-    constexpr uint16_t ANCHOR_TOKEN_READY = 1U << 2;
 
     ccu::Variable outputAddr;
     ccu::Variable outputToken;
@@ -1019,28 +1013,6 @@ CcuResult CcuMergePartialKernel(CcuKernelArg arg)
     CCU_RETURN_IF_ERROR(ccu::LoadArg(crossPartialAddr, argId++));
     CCU_RETURN_IF_ERROR(ccu::LoadArg(cclToken, argId++));
     CCU_RETURN_IF_ERROR(ccu::LoadArg(recvBytes, argId++));
-
-    if (kernelArg->channelCount != 0) {
-        std::vector<ccu::Variable> remoteAnchorAddrs(kernelArg->channelCount);
-        std::vector<ccu::Variable> remoteAnchorTokens(kernelArg->channelCount);
-        for (uint32_t channel = 0; channel < kernelArg->channelCount; ++channel) {
-            remoteAnchorAddrs[channel] =
-                ccu::GetResByChannel<ccu::Variable>(kernelArg->channels[channel], REMOTE_ANCHOR_ADDR_ID);
-            remoteAnchorTokens[channel] =
-                ccu::GetResByChannel<ccu::Variable>(kernelArg->channels[channel], REMOTE_ANCHOR_TOKEN_ID);
-            CCU_RETURN_IF_ERROR(ccu::WriteVariableWithNotify(kernelArg->channels[channel], outputAddr,
-                REMOTE_ANCHOR_ADDR_ID, CHANNEL_NOTIFY_INDEX, ANCHOR_ADDR_READY));
-            CCU_RETURN_IF_ERROR(ccu::WriteVariableWithNotify(kernelArg->channels[channel], outputToken,
-                REMOTE_ANCHOR_TOKEN_ID, CHANNEL_NOTIFY_INDEX, ANCHOR_TOKEN_READY));
-        }
-        for (uint32_t channel = 0; channel < kernelArg->channelCount; ++channel) {
-            CCU_RETURN_IF_ERROR(ccu::NotifyWait(kernelArg->channels[channel], CHANNEL_NOTIFY_INDEX,
-                static_cast<uint16_t>(ANCHOR_ADDR_READY | ANCHOR_TOKEN_READY)));
-        }
-        ccu::RemoteAddr dieAnchor;
-        dieAnchor.addr = remoteAnchorAddrs[0];
-        dieAnchor.token = remoteAnchorTokens[0];
-    }
 
     ccu::LocalAddr output;
     output.addr = outputAddr;
