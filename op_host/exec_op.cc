@@ -220,6 +220,15 @@ HcclResult ExecOp(const OpParam &param)
             outputAddr, outputToken, crossPartialAddr, cclToken, recvBytes};
         CHK_RET_CCU(HcommCcuKernelLaunch(resCtx.threads[0], resCtx.ccuKernels[2], mergeArgs.data(),
             static_cast<uint32_t>(mergeArgs.size())));
+        if (groupReduce) {
+            // CheckerV3 requires a slave stream to end with a local record.
+            // This final handshake also keeps the main stream alive until the
+            // slave has consumed the partial-barrier acknowledgement.
+            CHK_RET(static_cast<HcclResult>(
+                HcommThreadNotifyWaitOnThreadWithDefaultTimeout(resCtx.threads[0], 0)));
+            CHK_RET(static_cast<HcclResult>(
+                HcommThreadNotifyRecordOnThread(resCtx.threads[1], resCtx.threads[0], 0)));
+        }
         return HCCL_SUCCESS;
     }
 
