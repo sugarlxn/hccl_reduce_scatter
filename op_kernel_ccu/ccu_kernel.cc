@@ -971,9 +971,18 @@ CcuResult CcuPartialReduceKernel(CcuKernelArg arg)
 CcuResult CcuMergePartialKernel(CcuKernelArg arg)
 {
     auto *kernelArg = static_cast<CcuMergePartialKernelArg *>(arg);
-    if (kernelArg == nullptr) {
+    if (kernelArg == nullptr || kernelArg->channelCount != 1) {
         return CCU_E_PARA;
     }
+
+    // HcommCcuKernelRegister's dieId argument is currently reserved. Referencing
+    // one channel makes the translator place each merge kernel on the same IO
+    // Die as its corresponding partial-reduce kernel. No network instruction is
+    // emitted for this anchor.
+    constexpr uint32_t DIE_ANCHOR_VARIABLE_ID = 0;
+    const ccu::Variable dieAnchor =
+        ccu::GetResByChannel<ccu::Variable>(kernelArg->channels[0], DIE_ANCHOR_VARIABLE_ID);
+    (void)dieAnchor;
 
     ccu::Variable outputAddr;
     ccu::Variable outputToken;

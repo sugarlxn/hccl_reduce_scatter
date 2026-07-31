@@ -270,47 +270,63 @@ HcclResult RegisterDualDiePartialKernels(
     std::vector<ChannelHandle> crossChannels;
     CHK_RET(AcquireChannelsAtLayer(comm, param, 0, localPeers, localChannels));
     CHK_RET(AcquireChannelsAtLayer(comm, param, 1, resCtx.crossPeers, crossChannels));
+    CHK_PRT_RET(localChannels.empty() || crossChannels.empty(),
+        HCCL_ERROR("Dual-die merge requires one channel anchor on each IO Die"),
+        HCCL_E_INTERNAL);
 
     CcuKernelInfo localInfo{};
     CcuKernelInfo crossInfo{};
-    CcuKernelInfo mergeInfo{};
+    CcuKernelInfo localMergeInfo{};
+    CcuKernelInfo crossMergeInfo{};
     (void)snprintf(
         localInfo.kernelFuncName, sizeof(localInfo.kernelFuncName), "%s", "CcuTiledPartialReduceKernel");
     (void)snprintf(
         crossInfo.kernelFuncName, sizeof(crossInfo.kernelFuncName), "%s", "CcuTiledPartialReduceKernel");
-    (void)snprintf(mergeInfo.kernelFuncName, sizeof(mergeInfo.kernelFuncName), "%s", "CcuMergePartialKernel");
+    (void)snprintf(localMergeInfo.kernelFuncName, sizeof(localMergeInfo.kernelFuncName), "%s",
+        "CcuMergePartialLocalHalfKernel");
+    (void)snprintf(crossMergeInfo.kernelFuncName, sizeof(crossMergeInfo.kernelFuncName), "%s",
+        "CcuMergePartialCrossHalfKernel");
     localInfo.kernelFunc = reinterpret_cast<void *>(ops_hccl::CcuTiledPartialReduceKernel);
     crossInfo.kernelFunc = reinterpret_cast<void *>(ops_hccl::CcuTiledPartialReduceKernel);
-    mergeInfo.kernelFunc = reinterpret_cast<void *>(ops_hccl::CcuMergePartialKernel);
+    localMergeInfo.kernelFunc = reinterpret_cast<void *>(ops_hccl::CcuMergePartialKernel);
+    crossMergeInfo.kernelFunc = reinterpret_cast<void *>(ops_hccl::CcuMergePartialKernel);
     const uint32_t localSourceCount = static_cast<uint32_t>(resCtx.localRanks.size());
     const uint32_t crossSourceCount = static_cast<uint32_t>(resCtx.crossPeers.size());
     localInfo.setKernelArg(
         MakeTiledPartialKernelArg(param, localChannels, localSourceCount, true, localIndex));
     crossInfo.setKernelArg(
         MakeTiledPartialKernelArg(param, crossChannels, crossSourceCount, false, 0));
-    auto mergeKernelArg = std::make_shared<CcuMergePartialKernelArg>();
-    mergeKernelArg->dataType = param.dataType;
-    mergeKernelArg->reduceOp = param.reduceType;
-    mergeKernelArg->channelCount = 0;
-    mergeInfo.setKernelArg(mergeKernelArg);
+    auto makeMergeKernelArg = [&](ChannelHandle dieAnchor) {
+        auto kernelArg = std::make_shared<CcuMergePartialKernelArg>();
+        kernelArg->dataType = param.dataType;
+        kernelArg->reduceOp = param.reduceType;
+        kernelArg->channelCount = 1;
+        kernelArg->channels[0] = dieAnchor;
+        return kernelArg;
+    };
+    localMergeInfo.setKernelArg(makeMergeKernelArg(localChannels[0]));
+    crossMergeInfo.setKernelArg(makeMergeKernelArg(crossChannels[0]));
 
     CcuInsHandle insHandle = 0;
     uint32_t insNum = 0;
     CHK_RET(HcclCommQueryCcuIns(comm, &insHandle, &insNum));
     CHK_PRT_RET(insNum != 1, HCCL_ERROR("Expected one CCU instruction instance, got %u", insNum), HCCL_E_INTERNAL);
 
-    resCtx.ccuKernels.resize(3);
+    resCtx.ccuKernels.resize(4);
     CHK_RET_CCU(HcommCcuKernelRegisterStart(insHandle));
     const void *localArgs[] = {localInfo.kernelArg};
     const void *crossArgs[] = {crossInfo.kernelArg};
-    const void *mergeArgs[] = {mergeInfo.kernelArg};
+    const void *localMergeArgs[] = {localMergeInfo.kernelArg};
+    const void *crossMergeArgs[] = {crossMergeInfo.kernelArg};
     constexpr uint32_t DIE_ID_AUTO = 0;
     CHK_RET_CCU(HcommCcuKernelRegister(insHandle, DIE_ID_AUTO, localInfo.kernelFuncName, localInfo.kernelFunc,
         localArgs, 1, &resCtx.ccuKernels[0]));
     CHK_RET_CCU(HcommCcuKernelRegister(insHandle, DIE_ID_AUTO, crossInfo.kernelFuncName, crossInfo.kernelFunc,
         crossArgs, 1, &resCtx.ccuKernels[1]));
-    CHK_RET_CCU(HcommCcuKernelRegister(insHandle, DIE_ID_AUTO, mergeInfo.kernelFuncName, mergeInfo.kernelFunc,
-        mergeArgs, 1, &resCtx.ccuKernels[2]));
+    CHK_RET_CCU(HcommCcuKernelRegister(insHandle, DIE_ID_AUTO, localMergeInfo.kernelFuncName,
+        localMergeInfo.kernelFunc, localMergeArgs, 1, &resCtx.ccuKernels[2]));
+    CHK_RET_CCU(HcommCcuKernelRegister(insHandle, DIE_ID_AUTO, crossMergeInfo.kernelFuncName,
+        crossMergeInfo.kernelFunc, crossMergeArgs, 1, &resCtx.ccuKernels[3]));
     CHK_RET_CCU(HcommCcuKernelRegisterEnd(insHandle));
     resCtx.algorithm = ReduceScatterAlgorithm::DUAL_DIE_PARTIAL;
     return HCCL_SUCCESS;
@@ -520,7 +536,7 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
         (param.rankSize == 4 && inputBytes <= SMALL_INPUT_BYTES);
     const bool useStripedSingleDie =
         !useDualDie && !useSmallStagingTree && !useSmallClosParallel && !useDirect;
-    const char *algorithmTag = useDualDie ? "dual_die_v3_3" :
+    const char *algorithmTag = useDualDie ? "dual_die_v3_5" :
         (useSmallStagingTree ? "small_staging_tree_v1" :
         (useSmallClosParallel ? "small_clos_v3_3" :
         (useDirect ? "direct_small_v1" : "striped_single_die_v2")));
@@ -534,8 +550,10 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
     // ==============================================
     // STEP 2.1: 申请用于 Host/Device 同步的通信资源
     // ==============================================
-    // 将用户传入的 stream 转换为 CCU 通信引擎中的 thread，并申请 1 个 notify
-    constexpr uint32_t threadNotifyNum = 1;
+    // Dual-die v3.5 uses separate notify resources for the start, partial-done,
+    // and merge-done barriers. Each receiving thread observes every notify
+    // index at most once per operation, avoiding a record-before-wait collision.
+    const uint32_t threadNotifyNum = useDualDie ? 2U : 1U;
     CHK_RET(HcclThreadAcquireWithStream(comm, ccuEngine, stream, threadNotifyNum, &param.cpuThread));
 
     void *ctx = nullptr;
@@ -563,7 +581,7 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
         resCtxHost.threads.resize(threadNum);
         resCtxHost.threads[0] = param.cpuThread;
         if (useDualDie) {
-            CHK_RET(HcclThreadAcquire(comm, ccuEngine, 1, 1, &resCtxHost.threads[1]));
+            CHK_RET(HcclThreadAcquire(comm, ccuEngine, 1, 2, &resCtxHost.threads[1]));
         }
         resCtxHost.ccuThread = param.cpuThread;
 

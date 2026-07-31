@@ -75,7 +75,7 @@ HcclResult ExecOp(const OpParam &param)
     if (resCtx.algorithm == ReduceScatterAlgorithm::DUAL_DIE_PARTIAL ||
         resCtx.algorithm == ReduceScatterAlgorithm::SMALL_CLOS_PARALLEL) {
         const bool dualDie = resCtx.algorithm == ReduceScatterAlgorithm::DUAL_DIE_PARTIAL;
-        CHK_PRT_RET(resCtx.ccuKernels.size() != (dualDie ? 3U : 1U) ||
+        CHK_PRT_RET(resCtx.ccuKernels.size() != (dualDie ? 4U : 1U) ||
                 resCtx.threads.size() != (dualDie ? 2U : 1U),
             HCCL_ERROR("Incomplete partial-reduce resources"), HCCL_E_INTERNAL);
 
@@ -144,24 +144,54 @@ HcclResult ExecOp(const OpParam &param)
         const std::vector<uint64_t> crossArgs =
             makePartialArgs(crossPartialAddr, cclToken, crossScratchAddr, crossSourceCount);
 
-        // Main and slave threads target different IO Dies. The pre/post notify
-        // pair brackets both launches without serializing their data paths.
+        // Main and slave threads target different IO Dies. Keep the proven
+        // partial-reduce path unchanged, then use a two-way barrier before the
+        // two Dies merge disjoint halves of the result.
+        constexpr uint32_t START_NOTIFY = 0;
+        constexpr uint32_t SECONDARY_NOTIFY = 1;
         CHK_RET(static_cast<HcclResult>(
-            HcommThreadNotifyRecordOnThread(resCtx.threads[0], resCtx.threads[1], 0)));
+            HcommThreadNotifyRecordOnThread(
+                resCtx.threads[0], resCtx.threads[1], START_NOTIFY)));
         CHK_RET(static_cast<HcclResult>(
-            HcommThreadNotifyWaitOnThreadWithDefaultTimeout(resCtx.threads[1], 0)));
+            HcommThreadNotifyWaitOnThreadWithDefaultTimeout(
+                resCtx.threads[1], START_NOTIFY)));
         CHK_RET_CCU(HcommCcuKernelLaunch(resCtx.threads[0], resCtx.ccuKernels[0], localArgs.data(),
             static_cast<uint32_t>(localArgs.size())));
         CHK_RET_CCU(HcommCcuKernelLaunch(resCtx.threads[1], resCtx.ccuKernels[1], crossArgs.data(),
             static_cast<uint32_t>(crossArgs.size())));
         CHK_RET(static_cast<HcclResult>(
-            HcommThreadNotifyWaitOnThreadWithDefaultTimeout(resCtx.threads[0], 0)));
+            HcommThreadNotifyRecordOnThread(
+                resCtx.threads[0], resCtx.threads[1], SECONDARY_NOTIFY)));
         CHK_RET(static_cast<HcclResult>(
-            HcommThreadNotifyRecordOnThread(resCtx.threads[1], resCtx.threads[0], 0)));
-        const std::vector<uint64_t> mergeArgs = {
-            outputAddr, outputToken, crossPartialAddr, cclToken, recvBytes};
-        CHK_RET_CCU(HcommCcuKernelLaunch(resCtx.threads[0], resCtx.ccuKernels[2], mergeArgs.data(),
-            static_cast<uint32_t>(mergeArgs.size())));
+            HcommThreadNotifyWaitOnThreadWithDefaultTimeout(
+                resCtx.threads[1], SECONDARY_NOTIFY)));
+        CHK_RET(static_cast<HcclResult>(
+            HcommThreadNotifyRecordOnThread(
+                resCtx.threads[1], resCtx.threads[0], START_NOTIFY)));
+        CHK_RET(static_cast<HcclResult>(
+            HcommThreadNotifyWaitOnThreadWithDefaultTimeout(
+                resCtx.threads[0], START_NOTIFY)));
+
+        const uint64_t localMergeBytes = (param.count / 2) * dataTypeSize;
+        const uint64_t crossMergeBytes = recvBytes - localMergeBytes;
+        const std::vector<uint64_t> localMergeArgs = {
+            outputAddr, outputToken, crossPartialAddr, cclToken, localMergeBytes};
+        const std::vector<uint64_t> crossMergeArgs = {
+            outputAddr + localMergeBytes, outputToken,
+            crossPartialAddr + localMergeBytes, cclToken, crossMergeBytes};
+        CHK_RET_CCU(HcommCcuKernelLaunch(resCtx.threads[0], resCtx.ccuKernels[2],
+            localMergeArgs.data(), static_cast<uint32_t>(localMergeArgs.size())));
+        CHK_RET_CCU(HcommCcuKernelLaunch(resCtx.threads[1], resCtx.ccuKernels[3],
+            crossMergeArgs.data(), static_cast<uint32_t>(crossMergeArgs.size())));
+
+        // The operation is ordered by the main thread, so do not let it retire
+        // before the slave Die has completed its half.
+        CHK_RET(static_cast<HcclResult>(
+            HcommThreadNotifyRecordOnThread(
+                resCtx.threads[1], resCtx.threads[0], SECONDARY_NOTIFY)));
+        CHK_RET(static_cast<HcclResult>(
+            HcommThreadNotifyWaitOnThreadWithDefaultTimeout(
+                resCtx.threads[0], SECONDARY_NOTIFY)));
         return HCCL_SUCCESS;
     }
 
