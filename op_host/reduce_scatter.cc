@@ -31,6 +31,7 @@ CcuResult CcuStagingKernel(CcuKernelArg arg);
 CcuResult CcuLocalReduceKernel(CcuKernelArg arg);
 CcuResult CcuCrossReduceKernel(CcuKernelArg arg);
 CcuResult CcuPartialReduceKernel(CcuKernelArg arg);
+CcuResult CcuSmallStagingTreeKernel(CcuKernelArg arg);
 CcuResult CcuMergePartialKernel(CcuKernelArg arg);
 } // namespace ops_hccl
 
@@ -141,7 +142,7 @@ HcclResult RegisterMeshKernel(HcclComm comm, const OpParam &param, const std::ve
     return HCCL_SUCCESS;
 }
 
-[[maybe_unused]] HcclResult BuildHierarchyPlan(HcclComm comm, const OpParam &param, AlgResourceCtx &resCtx)
+HcclResult BuildHierarchyPlan(HcclComm comm, const OpParam &param, AlgResourceCtx &resCtx)
 {
     uint32_t *localRanks = nullptr;
     uint32_t localRankNum = 0;
@@ -192,7 +193,7 @@ HcclResult RegisterMeshKernel(HcclComm comm, const OpParam &param, const std::ve
     return HCCL_SUCCESS;
 }
 
-HcclResult BuildOwnTargetPlan(HcclComm comm, const OpParam &param, AlgResourceCtx &resCtx)
+[[maybe_unused]] HcclResult BuildOwnTargetPlan(HcclComm comm, const OpParam &param, AlgResourceCtx &resCtx)
 {
     uint32_t *localRanks = nullptr;
     uint32_t localRankNum = 0;
@@ -235,7 +236,8 @@ std::shared_ptr<CcuPartialReduceKernelArg> MakePartialKernelArg(const OpParam &p
     return kernelArg;
 }
 
-HcclResult RegisterDualDiePartialKernels(HcclComm comm, const OpParam &param, AlgResourceCtx &resCtx)
+[[maybe_unused]] HcclResult RegisterDualDiePartialKernels(
+    HcclComm comm, const OpParam &param, AlgResourceCtx &resCtx)
 {
     std::vector<uint32_t> localPeers;
     for (uint32_t rank : resCtx.localRanks) {
@@ -322,7 +324,36 @@ HcclResult RegisterStripedSingleDieKernel(HcclComm comm, const OpParam &param, A
     return HCCL_SUCCESS;
 }
 
-[[maybe_unused]] HcclResult RegisterHierarchicalKernels(HcclComm comm, const OpParam &param, bool useStaging,
+HcclResult RegisterSmallStagingTreeKernel(HcclComm comm, const OpParam &param, AlgResourceCtx &resCtx)
+{
+    std::vector<ChannelHandle> channels;
+    CHK_RET(AcquireMeshChannels(comm, param, channels));
+
+    CcuKernelInfo kernelInfo{};
+    (void)snprintf(
+        kernelInfo.kernelFuncName, sizeof(kernelInfo.kernelFuncName), "%s", "CcuSmallStagingTreeKernel");
+    kernelInfo.kernelFunc = reinterpret_cast<void *>(ops_hccl::CcuSmallStagingTreeKernel);
+    kernelInfo.setKernelArg(MakePartialKernelArg(
+        param, channels, param.rankSize, 1, true, param.myRank));
+
+    CcuInsHandle insHandle = 0;
+    uint32_t insNum = 0;
+    CHK_RET(HcclCommQueryCcuIns(comm, &insHandle, &insNum));
+    CHK_PRT_RET(insNum != 1, HCCL_ERROR("Expected one CCU instruction instance, got %u", insNum),
+        HCCL_E_INTERNAL);
+
+    resCtx.ccuKernels.resize(1);
+    CHK_RET_CCU(HcommCcuKernelRegisterStart(insHandle));
+    const void *kernelArgs[] = {kernelInfo.kernelArg};
+    constexpr uint32_t DIE_ID_AUTO = 0;
+    CHK_RET_CCU(HcommCcuKernelRegister(insHandle, DIE_ID_AUTO, kernelInfo.kernelFuncName, kernelInfo.kernelFunc,
+        kernelArgs, 1, &resCtx.ccuKernels[0]));
+    CHK_RET_CCU(HcommCcuKernelRegisterEnd(insHandle));
+    resCtx.algorithm = ReduceScatterAlgorithm::SMALL_STAGING_TREE;
+    return HCCL_SUCCESS;
+}
+
+HcclResult RegisterHierarchicalKernels(HcclComm comm, const OpParam &param, bool useStaging,
     AlgResourceCtx &resCtx)
 {
     std::vector<uint32_t> localPeers;
@@ -428,11 +459,17 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
     CHK_PRT_RET(dataType != HCCL_DATA_TYPE_FP32, HCCL_ERROR("Only float32 is supported"), HCCL_E_NOT_SUPPORT);
     CHK_PRT_RET(op != HCCL_REDUCE_SUM, HCCL_ERROR("Only sum reduction is supported"), HCCL_E_NOT_SUPPORT);
     const uint64_t inputBytes = recvCount * sizeof(float) * param.rankSize;
-    const bool useDualDie = (param.rankSize == 16 || param.rankSize == 12) && inputBytes > SMALL_INPUT_BYTES;
-    const bool useDirectTiny = recvCount < param.rankSize;
-    const bool useStripedSingleDie = !useDualDie && !useDirectTiny;
-    const char *algorithmTag = useDualDie ? "dual_die_striped_v2" :
-        (useDirectTiny ? "direct_tiny_v1" : "striped_single_die_v2");
+    const bool useHierarchical =
+        (param.rankSize == 16 || param.rankSize == 12) && inputBytes > SMALL_INPUT_BYTES;
+    const bool useSmallStagingTree =
+        (param.rankSize == 16 || param.rankSize == 12) && inputBytes <= SMALL_INPUT_BYTES &&
+        recvCount >= param.rankSize;
+    const bool useDirect = recvCount < param.rankSize ||
+        (param.rankSize == 4 && inputBytes <= SMALL_INPUT_BYTES);
+    const bool useStripedSingleDie = !useHierarchical && !useSmallStagingTree && !useDirect;
+    const char *algorithmTag = useHierarchical ? "hierarchical_pipeline_v1" :
+        (useSmallStagingTree ? "small_staging_tree_v1" :
+        (useDirect ? "direct_small_v1" : "striped_single_die_v2"));
     (void)snprintf(param.tag, sizeof(param.tag), "hccl_custom_reducescatter_%s", algorithmTag);
 
     // ==============================================
@@ -444,7 +481,8 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
     // STEP 2.1: 申请用于 Host/Device 同步的通信资源
     // ==============================================
     // 将用户传入的 stream 转换为 CCU 通信引擎中的 thread，并申请 1 个 notify
-    CHK_RET(HcclThreadAcquireWithStream(comm, ccuEngine, stream, 1, &param.cpuThread));
+    const uint32_t threadNotifyNum = useHierarchical ? 2 : 1;
+    CHK_RET(HcclThreadAcquireWithStream(comm, ccuEngine, stream, threadNotifyNum, &param.cpuThread));
 
     void *ctx = nullptr;
     uint64_t size = 0;
@@ -467,18 +505,20 @@ HcclResult HcclReduceScatter(void *sendBuf, void *recvBuf, uint64_t recvCount, H
         // STEP 2.2: 申请资源：Thread、Channel、CCU Kernel
         // ==============================================
 
-        const uint32_t threadNum = useDualDie ? 2 : 1;
+        const uint32_t threadNum = useHierarchical ? 2 : 1;
         resCtxHost.threads.resize(threadNum);
         resCtxHost.threads[0] = param.cpuThread;
-        if (useDualDie) {
-            CHK_RET(HcclThreadAcquire(comm, ccuEngine, 1, 1, &resCtxHost.threads[1]));
+        if (useHierarchical) {
+            CHK_RET(HcclThreadAcquire(comm, ccuEngine, 1, threadNotifyNum, &resCtxHost.threads[1]));
         }
         resCtxHost.ccuThread = param.cpuThread;
 
         if (param.rankSize > 1) {
-            if (useDualDie) {
-                CHK_RET(BuildOwnTargetPlan(comm, param, resCtxHost));
-                CHK_RET(RegisterDualDiePartialKernels(comm, param, resCtxHost));
+            if (useHierarchical) {
+                CHK_RET(BuildHierarchyPlan(comm, param, resCtxHost));
+                CHK_RET(RegisterHierarchicalKernels(comm, param, true, resCtxHost));
+            } else if (useSmallStagingTree) {
+                CHK_RET(RegisterSmallStagingTreeKernel(comm, param, resCtxHost));
             } else if (useStripedSingleDie) {
                 CHK_RET(RegisterStripedSingleDieKernel(comm, param, resCtxHost));
             } else {
