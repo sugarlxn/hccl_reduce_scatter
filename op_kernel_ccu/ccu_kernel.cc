@@ -610,6 +610,254 @@ CcuResult CcuSmallStagingTreeKernel(CcuKernelArg arg)
     return CCU_SUCCESS;
 }
 
+CcuResult FetchTiledPartial(const CcuTiledPartialReduceKernelArg *kernelArg,
+    const ccu::Variable &outputAddr, const ccu::Variable &outputToken,
+    const ccu::Variable &scratchToken, const ccu::Variable &sourceOffset,
+    const ccu::Variable &tileOffset, const ccu::Variable &tileBytes, uint32_t bank,
+    const std::vector<ccu::Variable> &stageAddrs,
+    const std::vector<ccu::Variable> &remoteInputAddr,
+    const std::vector<ccu::Variable> &remoteInputToken, ccu::Event &transferEvent)
+{
+    const uint32_t firstRemoteSource =
+        kernelArg->includeLocalSource && kernelArg->localSourceIndex == 0 ? 1 : 0;
+    uint32_t channelIdx = 0;
+    for (uint32_t source = 0; source < kernelArg->sourceCount; ++source) {
+        if (kernelArg->includeLocalSource && source == kernelArg->localSourceIndex) {
+            continue;
+        }
+
+        ccu::LocalAddr stage;
+        if (source == firstRemoteSource) {
+            stage.addr = outputAddr;
+            stage.addr += tileOffset;
+            stage.token = outputToken;
+        } else {
+            stage.addr = stageAddrs[bank * kernelArg->sourceCount + source];
+            stage.token = scratchToken;
+        }
+        const uint16_t mask = static_cast<uint16_t>(1U << channelIdx);
+
+        ccu::RemoteAddr src;
+        src.addr = remoteInputAddr[source];
+        src.addr += sourceOffset;
+        src.addr += tileOffset;
+        src.token = remoteInputToken[source];
+        CCU_RETURN_IF_ERROR(
+            ccu::Read(kernelArg->channels[channelIdx], stage, src, tileBytes, transferEvent, mask));
+        ++channelIdx;
+    }
+    return CCU_SUCCESS;
+}
+
+CcuResult ReduceTiledPartial(const CcuTiledPartialReduceKernelArg *kernelArg,
+    const ccu::Variable &outputAddr, const ccu::Variable &outputToken,
+    const ccu::Variable &inputAddr, const ccu::Variable &inputToken,
+    const ccu::Variable &scratchToken, const ccu::Variable &sourceOffset,
+    const ccu::Variable &tileOffset, const ccu::Variable &tileBytes, uint32_t bank,
+    const std::vector<ccu::Variable> &stageAddrs, ccu::Event &reduceEvent)
+{
+    std::vector<ccu::LocalAddr> work(kernelArg->sourceCount);
+    const uint32_t firstRemoteSource =
+        kernelArg->includeLocalSource && kernelArg->localSourceIndex == 0 ? 1 : 0;
+    uint32_t workIndex = 0;
+    for (uint32_t source = 0; source < kernelArg->sourceCount; ++source) {
+        if (kernelArg->includeLocalSource && source == kernelArg->localSourceIndex) {
+            continue;
+        }
+        if (source == firstRemoteSource) {
+            work[workIndex].addr = outputAddr;
+            work[workIndex].addr += tileOffset;
+            work[workIndex].token = outputToken;
+        } else {
+            work[workIndex].addr = stageAddrs[bank * kernelArg->sourceCount + source];
+            work[workIndex].token = scratchToken;
+        }
+        ++workIndex;
+    }
+    if (kernelArg->includeLocalSource) {
+        work[workIndex].addr = inputAddr;
+        work[workIndex].addr += sourceOffset;
+        work[workIndex].addr += tileOffset;
+        work[workIndex].token = inputToken;
+    }
+
+    // Fixed tree shape preserves deterministic FP32 accumulation.
+    uint32_t remain = kernelArg->sourceCount;
+    while (remain > 1) {
+        const uint32_t reducePieces = remain / 2;
+        const uint32_t sourceBase = remain - reducePieces;
+        for (uint32_t piece = 0; piece < reducePieces; ++piece) {
+            CCU_RETURN_IF_ERROR(ccu::LocalReduce(work[piece], work[sourceBase + piece], tileBytes,
+                kernelArg->dataType, kernelArg->reduceOp, reduceEvent,
+                static_cast<uint16_t>(1U << piece)));
+        }
+        CCU_RETURN_IF_ERROR(
+            ccu::EventWait(reduceEvent, static_cast<uint16_t>((1U << reducePieces) - 1U)));
+        remain -= reducePieces;
+    }
+    return CCU_SUCCESS;
+}
+
+CcuResult CcuTiledPartialReduceKernel(CcuKernelArg arg)
+{
+    auto *kernelArg = static_cast<CcuTiledPartialReduceKernelArg *>(arg);
+    if (kernelArg == nullptr || kernelArg->sourceCount == 0 ||
+        kernelArg->sourceCount > MAX_RANK_SIZE ||
+        kernelArg->channelCount !=
+            kernelArg->sourceCount - (kernelArg->includeLocalSource ? 1U : 0U) ||
+        (kernelArg->includeLocalSource &&
+            kernelArg->localSourceIndex >= kernelArg->sourceCount)) {
+        return CCU_E_PARA;
+    }
+
+    constexpr uint32_t REMOTE_INPUT_ADDR_ID = 1;
+    constexpr uint32_t REMOTE_INPUT_TOKEN_ID = 2;
+    constexpr uint32_t CHANNEL_NOTIFY_INDEX = 0;
+    constexpr uint16_t INPUT_ADDR_READY = 1U << 1;
+    constexpr uint16_t INPUT_TOKEN_READY = 1U << 2;
+
+    ccu::Variable outputAddr;
+    ccu::Variable outputToken;
+    ccu::Variable inputAddr;
+    ccu::Variable inputToken;
+    ccu::Variable scratchToken;
+    ccu::Variable sourceOffset;
+    ccu::Variable tileCapacity;
+    ccu::Variable pairCount;
+    ccu::Variable hasOddTile;
+    ccu::Variable tailBytes;
+    uint32_t argId = 0;
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(outputAddr, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(outputToken, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(inputAddr, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(inputToken, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(scratchToken, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(sourceOffset, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(tileCapacity, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(pairCount, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(hasOddTile, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(tailBytes, argId++));
+    std::vector<ccu::Variable> stageAddrs(2 * kernelArg->sourceCount);
+    for (uint32_t slot = 0; slot < stageAddrs.size(); ++slot) {
+        CCU_RETURN_IF_ERROR(ccu::LoadArg(stageAddrs[slot], argId++));
+    }
+
+    std::vector<ccu::Variable> remoteInputAddr(kernelArg->sourceCount);
+    std::vector<ccu::Variable> remoteInputToken(kernelArg->sourceCount);
+    uint32_t channelIdx = 0;
+    for (uint32_t source = 0; source < kernelArg->sourceCount; ++source) {
+        if (kernelArg->includeLocalSource && source == kernelArg->localSourceIndex) {
+            remoteInputAddr[source] = inputAddr;
+            remoteInputToken[source] = inputToken;
+            continue;
+        }
+        remoteInputAddr[source] =
+            ccu::GetResByChannel<ccu::Variable>(
+                kernelArg->channels[channelIdx], REMOTE_INPUT_ADDR_ID);
+        remoteInputToken[source] =
+            ccu::GetResByChannel<ccu::Variable>(
+                kernelArg->channels[channelIdx], REMOTE_INPUT_TOKEN_ID);
+        CCU_RETURN_IF_ERROR(ccu::WriteVariableWithNotify(kernelArg->channels[channelIdx],
+            inputAddr, REMOTE_INPUT_ADDR_ID, CHANNEL_NOTIFY_INDEX, INPUT_ADDR_READY));
+        CCU_RETURN_IF_ERROR(ccu::WriteVariableWithNotify(kernelArg->channels[channelIdx],
+            inputToken, REMOTE_INPUT_TOKEN_ID, CHANNEL_NOTIFY_INDEX, INPUT_TOKEN_READY));
+        ++channelIdx;
+    }
+    for (uint32_t i = 0; i < kernelArg->channelCount; ++i) {
+        CCU_RETURN_IF_ERROR(ccu::NotifyWait(kernelArg->channels[i], CHANNEL_NOTIFY_INDEX,
+            static_cast<uint16_t>(INPUT_ADDR_READY | INPUT_TOKEN_READY)));
+    }
+
+    ccu::Event transferEvent;
+    ccu::Event reduceEvent;
+    const uint16_t sourceMask =
+        static_cast<uint16_t>((1U << kernelArg->channelCount) - 1U);
+    ccu::Variable tileOffset;
+    ccu::Variable one;
+    tileOffset = 0;
+    one = 1;
+
+    CCU_IF(pairCount != UINT64_MAX)
+    {
+        CCU_RETURN_IF_ERROR(FetchTiledPartial(kernelArg, outputAddr, outputToken,
+            scratchToken, sourceOffset, tileOffset, tileCapacity, 0, stageAddrs,
+            remoteInputAddr, remoteInputToken, transferEvent));
+        CCU_RETURN_IF_ERROR(ccu::EventWait(transferEvent, sourceMask));
+    }
+
+    CCU_WHILE(pairCount != UINT64_MAX)
+    {
+        ccu::Variable nextOffset;
+        nextOffset = tileOffset;
+        nextOffset += tileCapacity;
+        CCU_RETURN_IF_ERROR(FetchTiledPartial(kernelArg, outputAddr, outputToken,
+            scratchToken, sourceOffset, nextOffset, tileCapacity, 1, stageAddrs,
+            remoteInputAddr, remoteInputToken, transferEvent));
+        CCU_RETURN_IF_ERROR(ReduceTiledPartial(kernelArg, outputAddr, outputToken,
+            inputAddr, inputToken, scratchToken, sourceOffset, tileOffset, tileCapacity,
+            0, stageAddrs, reduceEvent));
+        CCU_RETURN_IF_ERROR(ccu::EventWait(transferEvent, sourceMask));
+
+        tileOffset += tileCapacity;
+        tileOffset += tileCapacity;
+        pairCount += one;
+
+        CCU_IF(pairCount != UINT64_MAX)
+        {
+            CCU_RETURN_IF_ERROR(FetchTiledPartial(kernelArg, outputAddr, outputToken,
+                scratchToken, sourceOffset, tileOffset, tileCapacity, 0, stageAddrs,
+                remoteInputAddr, remoteInputToken, transferEvent));
+        }
+        CCU_RETURN_IF_ERROR(ReduceTiledPartial(kernelArg, outputAddr, outputToken,
+            inputAddr, inputToken, scratchToken, sourceOffset, nextOffset, tileCapacity,
+            1, stageAddrs, reduceEvent));
+        CCU_IF(pairCount != UINT64_MAX)
+        {
+            CCU_RETURN_IF_ERROR(ccu::EventWait(transferEvent, sourceMask));
+        }
+    }
+
+    CCU_IF(hasOddTile != 0)
+    {
+        CCU_RETURN_IF_ERROR(FetchTiledPartial(kernelArg, outputAddr, outputToken,
+            scratchToken, sourceOffset, tileOffset, tileCapacity, 0, stageAddrs,
+            remoteInputAddr, remoteInputToken, transferEvent));
+        CCU_RETURN_IF_ERROR(ccu::EventWait(transferEvent, sourceMask));
+        CCU_IF(tailBytes != 0)
+        {
+            ccu::Variable tailOffset;
+            tailOffset = tileOffset;
+            tailOffset += tileCapacity;
+            CCU_RETURN_IF_ERROR(FetchTiledPartial(kernelArg, outputAddr, outputToken,
+                scratchToken, sourceOffset, tailOffset, tailBytes, 1, stageAddrs,
+                remoteInputAddr, remoteInputToken, transferEvent));
+        }
+        CCU_RETURN_IF_ERROR(ReduceTiledPartial(kernelArg, outputAddr, outputToken,
+            inputAddr, inputToken, scratchToken, sourceOffset, tileOffset, tileCapacity,
+            0, stageAddrs, reduceEvent));
+        CCU_IF(tailBytes != 0)
+        {
+            CCU_RETURN_IF_ERROR(ccu::EventWait(transferEvent, sourceMask));
+        }
+        tileOffset += tileCapacity;
+    }
+
+    CCU_IF(tailBytes != 0)
+    {
+        CCU_IF(hasOddTile == 0)
+        {
+            CCU_RETURN_IF_ERROR(FetchTiledPartial(kernelArg, outputAddr, outputToken,
+                scratchToken, sourceOffset, tileOffset, tailBytes, 1, stageAddrs,
+                remoteInputAddr, remoteInputToken, transferEvent));
+            CCU_RETURN_IF_ERROR(ccu::EventWait(transferEvent, sourceMask));
+        }
+        CCU_RETURN_IF_ERROR(ReduceTiledPartial(kernelArg, outputAddr, outputToken,
+            inputAddr, inputToken, scratchToken, sourceOffset, tileOffset, tailBytes,
+            1, stageAddrs, reduceEvent));
+    }
+    return CCU_SUCCESS;
+}
+
 CcuResult CcuPartialReduceKernel(CcuKernelArg arg)
 {
     auto *kernelArg = static_cast<CcuPartialReduceKernelArg *>(arg);

@@ -66,6 +66,16 @@ struct CcuPartialReduceKernelArg : public CcuKernelArgBase {
     HcclReduceOp reduceOp;
 };
 
+// ccu-v3.3 tiled staging/tree kernel arguments. Kept separate from the
+// striped ReadReduce arguments so the topology selector can use both paths.
+struct CcuTiledPartialReduceKernelArg : public CcuKernelArgBase {
+    uint32_t sourceCount;
+    uint32_t localSourceIndex;
+    bool includeLocalSource;
+    HcclDataType dataType;
+    HcclReduceOp reduceOp;
+};
+
 struct CcuMergePartialKernelArg : public CcuKernelArgBase {
     HcclDataType dataType;
     HcclReduceOp reduceOp;
@@ -79,6 +89,7 @@ enum class ReduceScatterAlgorithm : uint32_t {
     DUAL_DIE_PARTIAL = 4,
     STRIPED_SINGLE_DIE = 5,
     SMALL_STAGING_TREE = 6,
+    SMALL_CLOS_PARALLEL = 7,
 };
 
 // ccu kernel register所需信息
