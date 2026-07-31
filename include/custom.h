@@ -39,6 +39,7 @@ struct CcuReduceScatterKernelArg : public CcuKernelArgBase {
 constexpr uint32_t MAX_LOCAL_RANK_SIZE = 8;
 constexpr uint32_t MAX_HIERARCHICAL_TARGETS = 3;
 constexpr uint32_t MAX_CROSS_PEERS = 2;
+constexpr uint32_t MAX_SINGLE_DIE_STRIPES = 4;
 
 struct CcuLocalReduceKernelArg : public CcuKernelArgBase {
     uint32_t groupSize;
@@ -58,6 +59,17 @@ struct CcuCrossReduceKernelArg : public CcuKernelArgBase {
 
 struct CcuPartialReduceKernelArg : public CcuKernelArgBase {
     uint32_t sourceCount;
+    uint32_t stripeCount;
+    uint32_t localSourceIndex;
+    bool includeLocalSource;
+    HcclDataType dataType;
+    HcclReduceOp reduceOp;
+};
+
+// ccu-v3.3 tiled staging/tree kernel arguments. Kept separate from the
+// striped ReadReduce arguments so the topology selector can use both paths.
+struct CcuTiledPartialReduceKernelArg : public CcuKernelArgBase {
+    uint32_t sourceCount;
     uint32_t localSourceIndex;
     bool includeLocalSource;
     HcclDataType dataType;
@@ -75,7 +87,9 @@ enum class ReduceScatterAlgorithm : uint32_t {
     HIERARCHICAL = 2,
     HIERARCHICAL_STAGING = 3,
     DUAL_DIE_PARTIAL = 4,
-    SMALL_CLOS_PARALLEL = 5,
+    STRIPED_SINGLE_DIE = 5,
+    SMALL_STAGING_TREE = 6,
+    SMALL_CLOS_PARALLEL = 7,
 };
 
 // ccu kernel register所需信息

@@ -493,10 +493,129 @@ CcuResult CcuLocalReduceKernel(CcuKernelArg arg)
     return CCU_SUCCESS;
 }
 
-CcuResult FetchPartialTile(const CcuPartialReduceKernelArg *kernelArg, const ccu::Variable &outputAddr,
-    const ccu::Variable &outputToken, const ccu::Variable &scratchToken, const ccu::Variable &sourceOffset,
+CcuResult CcuSmallStagingTreeKernel(CcuKernelArg arg)
+{
+    auto *kernelArg = static_cast<CcuPartialReduceKernelArg *>(arg);
+    if (kernelArg == nullptr || kernelArg->sourceCount < 2 || kernelArg->sourceCount > MAX_RANK_SIZE ||
+        !kernelArg->includeLocalSource || kernelArg->localSourceIndex >= kernelArg->sourceCount ||
+        kernelArg->channelCount != kernelArg->sourceCount - 1) {
+        return CCU_E_PARA;
+    }
+
+    constexpr uint32_t REMOTE_INPUT_ADDR_ID = 1;
+    constexpr uint32_t REMOTE_INPUT_TOKEN_ID = 2;
+    constexpr uint32_t CHANNEL_NOTIFY_INDEX = 0;
+    constexpr uint16_t INPUT_ADDR_READY = 1U << 1;
+    constexpr uint16_t INPUT_TOKEN_READY = 1U << 2;
+
+    ccu::Variable outputAddr;
+    ccu::Variable outputToken;
+    ccu::Variable inputAddr;
+    ccu::Variable inputToken;
+    ccu::Variable scratchToken;
+    ccu::Variable sourceOffset;
+    ccu::Variable chunkBytes;
+    uint32_t argId = 0;
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(outputAddr, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(outputToken, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(inputAddr, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(inputToken, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(scratchToken, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(sourceOffset, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(chunkBytes, argId++));
+
+    std::vector<ccu::Variable> stageAddrs(kernelArg->sourceCount);
+    for (uint32_t source = 0; source < kernelArg->sourceCount; ++source) {
+        CCU_RETURN_IF_ERROR(ccu::LoadArg(stageAddrs[source], argId++));
+    }
+
+    std::vector<ccu::Variable> remoteInputAddr(kernelArg->sourceCount);
+    std::vector<ccu::Variable> remoteInputToken(kernelArg->sourceCount);
+    uint32_t channelIdx = 0;
+    for (uint32_t source = 0; source < kernelArg->sourceCount; ++source) {
+        if (source == kernelArg->localSourceIndex) {
+            remoteInputAddr[source] = inputAddr;
+            remoteInputToken[source] = inputToken;
+            continue;
+        }
+        remoteInputAddr[source] =
+            ccu::GetResByChannel<ccu::Variable>(kernelArg->channels[channelIdx], REMOTE_INPUT_ADDR_ID);
+        remoteInputToken[source] =
+            ccu::GetResByChannel<ccu::Variable>(kernelArg->channels[channelIdx], REMOTE_INPUT_TOKEN_ID);
+        CCU_RETURN_IF_ERROR(ccu::WriteVariableWithNotify(kernelArg->channels[channelIdx], inputAddr,
+            REMOTE_INPUT_ADDR_ID, CHANNEL_NOTIFY_INDEX, INPUT_ADDR_READY));
+        CCU_RETURN_IF_ERROR(ccu::WriteVariableWithNotify(kernelArg->channels[channelIdx], inputToken,
+            REMOTE_INPUT_TOKEN_ID, CHANNEL_NOTIFY_INDEX, INPUT_TOKEN_READY));
+        ++channelIdx;
+    }
+    for (uint32_t i = 0; i < kernelArg->channelCount; ++i) {
+        CCU_RETURN_IF_ERROR(ccu::NotifyWait(kernelArg->channels[i], CHANNEL_NOTIFY_INDEX,
+            static_cast<uint16_t>(INPUT_ADDR_READY | INPUT_TOKEN_READY)));
+    }
+
+    // Pull all remote contributions concurrently. The first one lands directly
+    // in output; the others use disjoint CCL-buffer slots.
+    const uint32_t firstRemoteSource = kernelArg->localSourceIndex == 0 ? 1 : 0;
+    ccu::Event transferEvent;
+    channelIdx = 0;
+    for (uint32_t source = 0; source < kernelArg->sourceCount; ++source) {
+        if (source == kernelArg->localSourceIndex) {
+            continue;
+        }
+        ccu::LocalAddr dst;
+        dst.addr = source == firstRemoteSource ? outputAddr : stageAddrs[source];
+        dst.token = source == firstRemoteSource ? outputToken : scratchToken;
+        ccu::RemoteAddr src;
+        src.addr = remoteInputAddr[source];
+        src.addr += sourceOffset;
+        src.token = remoteInputToken[source];
+        CCU_RETURN_IF_ERROR(ccu::Read(kernelArg->channels[channelIdx], dst, src, chunkBytes,
+            transferEvent, static_cast<uint16_t>(1U << channelIdx)));
+        ++channelIdx;
+    }
+    const uint16_t allChannelsMask =
+        static_cast<uint16_t>((1U << kernelArg->channelCount) - 1U);
+    CCU_RETURN_IF_ERROR(ccu::EventWait(transferEvent, allChannelsMask));
+
+    // Build a stable leaf order and reduce disjoint pairs at each tree level.
+    // The tree is fixed for a rank size, satisfying deterministic FP32 output.
+    std::vector<ccu::LocalAddr> work(kernelArg->sourceCount);
+    uint32_t workIndex = 0;
+    for (uint32_t source = 0; source < kernelArg->sourceCount; ++source) {
+        if (source == kernelArg->localSourceIndex) {
+            continue;
+        }
+        work[workIndex].addr = source == firstRemoteSource ? outputAddr : stageAddrs[source];
+        work[workIndex].token = source == firstRemoteSource ? outputToken : scratchToken;
+        ++workIndex;
+    }
+    work[workIndex].addr = inputAddr;
+    work[workIndex].addr += sourceOffset;
+    work[workIndex].token = inputToken;
+
+    ccu::Event reduceEvent;
+    uint32_t remain = kernelArg->sourceCount;
+    while (remain > 1) {
+        const uint32_t reducePieces = remain / 2;
+        const uint32_t sourceBase = remain - reducePieces;
+        for (uint32_t piece = 0; piece < reducePieces; ++piece) {
+            CCU_RETURN_IF_ERROR(ccu::LocalReduce(work[piece], work[sourceBase + piece], chunkBytes,
+                kernelArg->dataType, kernelArg->reduceOp, reduceEvent,
+                static_cast<uint16_t>(1U << piece)));
+        }
+        CCU_RETURN_IF_ERROR(
+            ccu::EventWait(reduceEvent, static_cast<uint16_t>((1U << reducePieces) - 1U)));
+        remain -= reducePieces;
+    }
+    return CCU_SUCCESS;
+}
+
+CcuResult FetchTiledPartial(const CcuTiledPartialReduceKernelArg *kernelArg,
+    const ccu::Variable &outputAddr, const ccu::Variable &outputToken,
+    const ccu::Variable &scratchToken, const ccu::Variable &sourceOffset,
     const ccu::Variable &tileOffset, const ccu::Variable &tileBytes, uint32_t bank,
-    const std::vector<ccu::Variable> &stageAddrs, const std::vector<ccu::Variable> &remoteInputAddr,
+    const std::vector<ccu::Variable> &stageAddrs,
+    const std::vector<ccu::Variable> &remoteInputAddr,
     const std::vector<ccu::Variable> &remoteInputToken, ccu::Event &transferEvent)
 {
     const uint32_t firstRemoteSource =
@@ -530,11 +649,12 @@ CcuResult FetchPartialTile(const CcuPartialReduceKernelArg *kernelArg, const ccu
     return CCU_SUCCESS;
 }
 
-CcuResult ReducePartialTile(const CcuPartialReduceKernelArg *kernelArg, const ccu::Variable &outputAddr,
-    const ccu::Variable &outputToken, const ccu::Variable &inputAddr, const ccu::Variable &inputToken,
-    const ccu::Variable &scratchToken, const ccu::Variable &sourceOffset, const ccu::Variable &tileOffset,
-    const ccu::Variable &tileBytes, uint32_t bank, const std::vector<ccu::Variable> &stageAddrs,
-    ccu::Event &reduceEvent)
+CcuResult ReduceTiledPartial(const CcuTiledPartialReduceKernelArg *kernelArg,
+    const ccu::Variable &outputAddr, const ccu::Variable &outputToken,
+    const ccu::Variable &inputAddr, const ccu::Variable &inputToken,
+    const ccu::Variable &scratchToken, const ccu::Variable &sourceOffset,
+    const ccu::Variable &tileOffset, const ccu::Variable &tileBytes, uint32_t bank,
+    const std::vector<ccu::Variable> &stageAddrs, ccu::Event &reduceEvent)
 {
     std::vector<ccu::LocalAddr> work(kernelArg->sourceCount);
     const uint32_t firstRemoteSource =
@@ -561,15 +681,15 @@ CcuResult ReducePartialTile(const CcuPartialReduceKernelArg *kernelArg, const cc
         work[workIndex].token = inputToken;
     }
 
-    // Reduce disjoint pairs in parallel at every tree level. The tree shape is
-    // fixed by sourceCount, so FP32 accumulation remains deterministic.
+    // Fixed tree shape preserves deterministic FP32 accumulation.
     uint32_t remain = kernelArg->sourceCount;
     while (remain > 1) {
         const uint32_t reducePieces = remain / 2;
         const uint32_t sourceBase = remain - reducePieces;
         for (uint32_t piece = 0; piece < reducePieces; ++piece) {
             CCU_RETURN_IF_ERROR(ccu::LocalReduce(work[piece], work[sourceBase + piece], tileBytes,
-                kernelArg->dataType, kernelArg->reduceOp, reduceEvent, static_cast<uint16_t>(1U << piece)));
+                kernelArg->dataType, kernelArg->reduceOp, reduceEvent,
+                static_cast<uint16_t>(1U << piece)));
         }
         CCU_RETURN_IF_ERROR(
             ccu::EventWait(reduceEvent, static_cast<uint16_t>((1U << reducePieces) - 1U)));
@@ -578,12 +698,15 @@ CcuResult ReducePartialTile(const CcuPartialReduceKernelArg *kernelArg, const cc
     return CCU_SUCCESS;
 }
 
-CcuResult CcuPartialReduceKernel(CcuKernelArg arg)
+CcuResult CcuTiledPartialReduceKernel(CcuKernelArg arg)
 {
-    auto *kernelArg = static_cast<CcuPartialReduceKernelArg *>(arg);
-    if (kernelArg == nullptr || kernelArg->sourceCount == 0 || kernelArg->sourceCount > MAX_RANK_SIZE ||
-        kernelArg->channelCount != kernelArg->sourceCount - (kernelArg->includeLocalSource ? 1U : 0U) ||
-        (kernelArg->includeLocalSource && kernelArg->localSourceIndex >= kernelArg->sourceCount)) {
+    auto *kernelArg = static_cast<CcuTiledPartialReduceKernelArg *>(arg);
+    if (kernelArg == nullptr || kernelArg->sourceCount == 0 ||
+        kernelArg->sourceCount > MAX_RANK_SIZE ||
+        kernelArg->channelCount !=
+            kernelArg->sourceCount - (kernelArg->includeLocalSource ? 1U : 0U) ||
+        (kernelArg->includeLocalSource &&
+            kernelArg->localSourceIndex >= kernelArg->sourceCount)) {
         return CCU_E_PARA;
     }
 
@@ -629,13 +752,15 @@ CcuResult CcuPartialReduceKernel(CcuKernelArg arg)
             continue;
         }
         remoteInputAddr[source] =
-            ccu::GetResByChannel<ccu::Variable>(kernelArg->channels[channelIdx], REMOTE_INPUT_ADDR_ID);
+            ccu::GetResByChannel<ccu::Variable>(
+                kernelArg->channels[channelIdx], REMOTE_INPUT_ADDR_ID);
         remoteInputToken[source] =
-            ccu::GetResByChannel<ccu::Variable>(kernelArg->channels[channelIdx], REMOTE_INPUT_TOKEN_ID);
-        CCU_RETURN_IF_ERROR(ccu::WriteVariableWithNotify(kernelArg->channels[channelIdx], inputAddr,
-            REMOTE_INPUT_ADDR_ID, CHANNEL_NOTIFY_INDEX, INPUT_ADDR_READY));
-        CCU_RETURN_IF_ERROR(ccu::WriteVariableWithNotify(kernelArg->channels[channelIdx], inputToken,
-            REMOTE_INPUT_TOKEN_ID, CHANNEL_NOTIFY_INDEX, INPUT_TOKEN_READY));
+            ccu::GetResByChannel<ccu::Variable>(
+                kernelArg->channels[channelIdx], REMOTE_INPUT_TOKEN_ID);
+        CCU_RETURN_IF_ERROR(ccu::WriteVariableWithNotify(kernelArg->channels[channelIdx],
+            inputAddr, REMOTE_INPUT_ADDR_ID, CHANNEL_NOTIFY_INDEX, INPUT_ADDR_READY));
+        CCU_RETURN_IF_ERROR(ccu::WriteVariableWithNotify(kernelArg->channels[channelIdx],
+            inputToken, REMOTE_INPUT_TOKEN_ID, CHANNEL_NOTIFY_INDEX, INPUT_TOKEN_READY));
         ++channelIdx;
     }
     for (uint32_t i = 0; i < kernelArg->channelCount; ++i) {
@@ -652,13 +777,11 @@ CcuResult CcuPartialReduceKernel(CcuKernelArg arg)
     tileOffset = 0;
     one = 1;
 
-    // Prime bank 0 once. Each loop iteration then starts the following bank
-    // before reducing the ready bank, keeping reads active across pair boundaries.
     CCU_IF(pairCount != UINT64_MAX)
     {
-        CCU_RETURN_IF_ERROR(FetchPartialTile(kernelArg, outputAddr, outputToken, scratchToken,
-            sourceOffset, tileOffset, tileCapacity, 0, stageAddrs, remoteInputAddr, remoteInputToken,
-            transferEvent));
+        CCU_RETURN_IF_ERROR(FetchTiledPartial(kernelArg, outputAddr, outputToken,
+            scratchToken, sourceOffset, tileOffset, tileCapacity, 0, stageAddrs,
+            remoteInputAddr, remoteInputToken, transferEvent));
         CCU_RETURN_IF_ERROR(ccu::EventWait(transferEvent, sourceMask));
     }
 
@@ -667,11 +790,12 @@ CcuResult CcuPartialReduceKernel(CcuKernelArg arg)
         ccu::Variable nextOffset;
         nextOffset = tileOffset;
         nextOffset += tileCapacity;
-        CCU_RETURN_IF_ERROR(FetchPartialTile(kernelArg, outputAddr, outputToken, scratchToken,
-            sourceOffset, nextOffset, tileCapacity, 1, stageAddrs, remoteInputAddr, remoteInputToken,
-            transferEvent));
-        CCU_RETURN_IF_ERROR(ReducePartialTile(kernelArg, outputAddr, outputToken, inputAddr, inputToken,
-            scratchToken, sourceOffset, tileOffset, tileCapacity, 0, stageAddrs, reduceEvent));
+        CCU_RETURN_IF_ERROR(FetchTiledPartial(kernelArg, outputAddr, outputToken,
+            scratchToken, sourceOffset, nextOffset, tileCapacity, 1, stageAddrs,
+            remoteInputAddr, remoteInputToken, transferEvent));
+        CCU_RETURN_IF_ERROR(ReduceTiledPartial(kernelArg, outputAddr, outputToken,
+            inputAddr, inputToken, scratchToken, sourceOffset, tileOffset, tileCapacity,
+            0, stageAddrs, reduceEvent));
         CCU_RETURN_IF_ERROR(ccu::EventWait(transferEvent, sourceMask));
 
         tileOffset += tileCapacity;
@@ -680,12 +804,13 @@ CcuResult CcuPartialReduceKernel(CcuKernelArg arg)
 
         CCU_IF(pairCount != UINT64_MAX)
         {
-            CCU_RETURN_IF_ERROR(FetchPartialTile(kernelArg, outputAddr, outputToken, scratchToken,
-                sourceOffset, tileOffset, tileCapacity, 0, stageAddrs, remoteInputAddr, remoteInputToken,
-                transferEvent));
+            CCU_RETURN_IF_ERROR(FetchTiledPartial(kernelArg, outputAddr, outputToken,
+                scratchToken, sourceOffset, tileOffset, tileCapacity, 0, stageAddrs,
+                remoteInputAddr, remoteInputToken, transferEvent));
         }
-        CCU_RETURN_IF_ERROR(ReducePartialTile(kernelArg, outputAddr, outputToken, inputAddr, inputToken,
-            scratchToken, sourceOffset, nextOffset, tileCapacity, 1, stageAddrs, reduceEvent));
+        CCU_RETURN_IF_ERROR(ReduceTiledPartial(kernelArg, outputAddr, outputToken,
+            inputAddr, inputToken, scratchToken, sourceOffset, nextOffset, tileCapacity,
+            1, stageAddrs, reduceEvent));
         CCU_IF(pairCount != UINT64_MAX)
         {
             CCU_RETURN_IF_ERROR(ccu::EventWait(transferEvent, sourceMask));
@@ -694,21 +819,22 @@ CcuResult CcuPartialReduceKernel(CcuKernelArg arg)
 
     CCU_IF(hasOddTile != 0)
     {
-        CCU_RETURN_IF_ERROR(FetchPartialTile(kernelArg, outputAddr, outputToken, scratchToken,
-            sourceOffset, tileOffset, tileCapacity, 0, stageAddrs, remoteInputAddr, remoteInputToken,
-            transferEvent));
+        CCU_RETURN_IF_ERROR(FetchTiledPartial(kernelArg, outputAddr, outputToken,
+            scratchToken, sourceOffset, tileOffset, tileCapacity, 0, stageAddrs,
+            remoteInputAddr, remoteInputToken, transferEvent));
         CCU_RETURN_IF_ERROR(ccu::EventWait(transferEvent, sourceMask));
         CCU_IF(tailBytes != 0)
         {
             ccu::Variable tailOffset;
             tailOffset = tileOffset;
             tailOffset += tileCapacity;
-            CCU_RETURN_IF_ERROR(FetchPartialTile(kernelArg, outputAddr, outputToken, scratchToken,
-                sourceOffset, tailOffset, tailBytes, 1, stageAddrs, remoteInputAddr, remoteInputToken,
-                transferEvent));
+            CCU_RETURN_IF_ERROR(FetchTiledPartial(kernelArg, outputAddr, outputToken,
+                scratchToken, sourceOffset, tailOffset, tailBytes, 1, stageAddrs,
+                remoteInputAddr, remoteInputToken, transferEvent));
         }
-        CCU_RETURN_IF_ERROR(ReducePartialTile(kernelArg, outputAddr, outputToken, inputAddr, inputToken,
-            scratchToken, sourceOffset, tileOffset, tileCapacity, 0, stageAddrs, reduceEvent));
+        CCU_RETURN_IF_ERROR(ReduceTiledPartial(kernelArg, outputAddr, outputToken,
+            inputAddr, inputToken, scratchToken, sourceOffset, tileOffset, tileCapacity,
+            0, stageAddrs, reduceEvent));
         CCU_IF(tailBytes != 0)
         {
             CCU_RETURN_IF_ERROR(ccu::EventWait(transferEvent, sourceMask));
@@ -720,13 +846,124 @@ CcuResult CcuPartialReduceKernel(CcuKernelArg arg)
     {
         CCU_IF(hasOddTile == 0)
         {
-            CCU_RETURN_IF_ERROR(FetchPartialTile(kernelArg, outputAddr, outputToken, scratchToken,
-                sourceOffset, tileOffset, tailBytes, 1, stageAddrs, remoteInputAddr, remoteInputToken,
-                transferEvent));
+            CCU_RETURN_IF_ERROR(FetchTiledPartial(kernelArg, outputAddr, outputToken,
+                scratchToken, sourceOffset, tileOffset, tailBytes, 1, stageAddrs,
+                remoteInputAddr, remoteInputToken, transferEvent));
             CCU_RETURN_IF_ERROR(ccu::EventWait(transferEvent, sourceMask));
         }
-        CCU_RETURN_IF_ERROR(ReducePartialTile(kernelArg, outputAddr, outputToken, inputAddr, inputToken,
-            scratchToken, sourceOffset, tileOffset, tailBytes, 1, stageAddrs, reduceEvent));
+        CCU_RETURN_IF_ERROR(ReduceTiledPartial(kernelArg, outputAddr, outputToken,
+            inputAddr, inputToken, scratchToken, sourceOffset, tileOffset, tailBytes,
+            1, stageAddrs, reduceEvent));
+    }
+    return CCU_SUCCESS;
+}
+
+CcuResult CcuPartialReduceKernel(CcuKernelArg arg)
+{
+    auto *kernelArg = static_cast<CcuPartialReduceKernelArg *>(arg);
+    if (kernelArg == nullptr || kernelArg->sourceCount == 0 || kernelArg->sourceCount > MAX_RANK_SIZE ||
+        kernelArg->stripeCount == 0 || kernelArg->stripeCount > kernelArg->sourceCount ||
+        kernelArg->channelCount != kernelArg->sourceCount - (kernelArg->includeLocalSource ? 1U : 0U) ||
+        (kernelArg->includeLocalSource && kernelArg->localSourceIndex >= kernelArg->sourceCount)) {
+        return CCU_E_PARA;
+    }
+
+    constexpr uint32_t REMOTE_INPUT_ADDR_ID = 1;
+    constexpr uint32_t REMOTE_INPUT_TOKEN_ID = 2;
+    constexpr uint32_t CHANNEL_NOTIFY_INDEX = 0;
+    constexpr uint16_t INPUT_ADDR_READY = 1U << 1;
+    constexpr uint16_t INPUT_TOKEN_READY = 1U << 2;
+
+    ccu::Variable outputAddr;
+    ccu::Variable outputToken;
+    ccu::Variable inputAddr;
+    ccu::Variable inputToken;
+    ccu::Variable sourceOffset;
+    std::vector<ccu::Variable> stripeOffsets(kernelArg->stripeCount);
+    std::vector<ccu::Variable> stripeBytes(kernelArg->stripeCount);
+    uint32_t argId = 0;
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(outputAddr, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(outputToken, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(inputAddr, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(inputToken, argId++));
+    CCU_RETURN_IF_ERROR(ccu::LoadArg(sourceOffset, argId++));
+    for (uint32_t stripe = 0; stripe < kernelArg->stripeCount; ++stripe) {
+        CCU_RETURN_IF_ERROR(ccu::LoadArg(stripeOffsets[stripe], argId++));
+        CCU_RETURN_IF_ERROR(ccu::LoadArg(stripeBytes[stripe], argId++));
+    }
+
+    std::vector<ccu::Variable> remoteInputAddr(kernelArg->sourceCount);
+    std::vector<ccu::Variable> remoteInputToken(kernelArg->sourceCount);
+    uint32_t channelIdx = 0;
+    for (uint32_t source = 0; source < kernelArg->sourceCount; ++source) {
+        if (kernelArg->includeLocalSource && source == kernelArg->localSourceIndex) {
+            remoteInputAddr[source] = inputAddr;
+            remoteInputToken[source] = inputToken;
+            continue;
+        }
+        remoteInputAddr[source] =
+            ccu::GetResByChannel<ccu::Variable>(kernelArg->channels[channelIdx], REMOTE_INPUT_ADDR_ID);
+        remoteInputToken[source] =
+            ccu::GetResByChannel<ccu::Variable>(kernelArg->channels[channelIdx], REMOTE_INPUT_TOKEN_ID);
+        CCU_RETURN_IF_ERROR(ccu::WriteVariableWithNotify(kernelArg->channels[channelIdx], inputAddr,
+            REMOTE_INPUT_ADDR_ID, CHANNEL_NOTIFY_INDEX, INPUT_ADDR_READY));
+        CCU_RETURN_IF_ERROR(ccu::WriteVariableWithNotify(kernelArg->channels[channelIdx], inputToken,
+            REMOTE_INPUT_TOKEN_ID, CHANNEL_NOTIFY_INDEX, INPUT_TOKEN_READY));
+        ++channelIdx;
+    }
+    for (uint32_t i = 0; i < kernelArg->channelCount; ++i) {
+        CCU_RETURN_IF_ERROR(ccu::NotifyWait(kernelArg->channels[i], CHANNEL_NOTIFY_INDEX,
+            static_cast<uint16_t>(INPUT_ADDR_READY | INPUT_TOKEN_READY)));
+    }
+
+    // Split the partial into independent stripes. In every round,
+    // (stripe + round) % sourceCount selects distinct sources, so each channel
+    // is used at most once and every operation writes a disjoint range. Across
+    // sourceCount rounds every stripe consumes every source in a fixed cyclic
+    // order, preserving deterministic FP32 accumulation without HBM staging.
+    ccu::Event stripeEvent;
+    const uint16_t allStripesMask = static_cast<uint16_t>(
+        kernelArg->stripeCount == 16 ? 0xFFFFU : ((1U << kernelArg->stripeCount) - 1U));
+    for (uint32_t round = 0; round < kernelArg->sourceCount; ++round) {
+        for (uint32_t stripe = 0; stripe < kernelArg->stripeCount; ++stripe) {
+            const uint32_t source = (stripe + round) % kernelArg->sourceCount;
+            const uint16_t mask = static_cast<uint16_t>(1U << stripe);
+
+            ccu::LocalAddr dst;
+            dst.addr = outputAddr;
+            dst.addr += stripeOffsets[stripe];
+            dst.token = outputToken;
+
+            if (kernelArg->includeLocalSource && source == kernelArg->localSourceIndex) {
+                ccu::LocalAddr src;
+                src.addr = inputAddr;
+                src.addr += sourceOffset;
+                src.addr += stripeOffsets[stripe];
+                src.token = inputToken;
+                if (round == 0) {
+                    CCU_RETURN_IF_ERROR(ccu::LocalCopy(dst, src, stripeBytes[stripe], stripeEvent, mask));
+                } else {
+                    CCU_RETURN_IF_ERROR(ccu::LocalReduce(dst, src, stripeBytes[stripe],
+                        kernelArg->dataType, kernelArg->reduceOp, stripeEvent, mask));
+                }
+            } else {
+                const uint32_t sourceChannel =
+                    kernelArg->includeLocalSource && source > kernelArg->localSourceIndex ? source - 1 : source;
+                ccu::RemoteAddr src;
+                src.addr = remoteInputAddr[source];
+                src.addr += sourceOffset;
+                src.addr += stripeOffsets[stripe];
+                src.token = remoteInputToken[source];
+                if (round == 0) {
+                    CCU_RETURN_IF_ERROR(ccu::Read(kernelArg->channels[sourceChannel], dst, src,
+                        stripeBytes[stripe], stripeEvent, mask));
+                } else {
+                    CCU_RETURN_IF_ERROR(ccu::ReadReduce(kernelArg->channels[sourceChannel], dst, src,
+                        stripeBytes[stripe], kernelArg->dataType, kernelArg->reduceOp, stripeEvent, mask));
+                }
+            }
+        }
+        CCU_RETURN_IF_ERROR(ccu::EventWait(stripeEvent, allStripesMask));
     }
     return CCU_SUCCESS;
 }
@@ -776,6 +1013,7 @@ CcuResult CcuCrossReduceKernel(CcuKernelArg arg)
     constexpr uint32_t CHANNEL_NOTIFY_INDEX = 0;
     constexpr uint16_t PARTIAL_ADDR_READY = 1U << 1;
     constexpr uint16_t PARTIAL_TOKEN_READY = 1U << 2;
+    constexpr uint16_t CROSS_READ_DONE = 1U << 3;
 
     ccu::Variable outputAddr;
     ccu::Variable outputToken;
@@ -831,6 +1069,18 @@ CcuResult CcuCrossReduceKernel(CcuKernelArg arg)
     CCU_RETURN_IF_ERROR(ccu::ReadReduce(kernelArg->channels[0], dst, src, chunkBytes,
         kernelArg->dataType, kernelArg->reduceOp, readEvent));
     CCU_RETURN_IF_ERROR(ccu::EventWait(readEvent));
+
+    // A local ReadReduce completion only proves that this rank stopped reading
+    // its peer. Complete a symmetric handshake so the host-side ACK also proves
+    // every peer stopped reading our advertised partial before bank reuse.
+    for (uint32_t i = 0; i < kernelArg->channelCount; ++i) {
+        CCU_RETURN_IF_ERROR(
+            ccu::NotifyRecord(kernelArg->channels[i], CHANNEL_NOTIFY_INDEX, CROSS_READ_DONE));
+    }
+    for (uint32_t i = 0; i < kernelArg->channelCount; ++i) {
+        CCU_RETURN_IF_ERROR(
+            ccu::NotifyWait(kernelArg->channels[i], CHANNEL_NOTIFY_INDEX, CROSS_READ_DONE));
+    }
     return CCU_SUCCESS;
 }
 
