@@ -13,3 +13,4 @@
 10,ReadReduce-v1.0,2026/07/30 20:14:38,189.95,pass,pass,pass,pass,pass,pass,pass,pass,pass,74.00μs,1.82ms,1.39ms,22.00μs,2.31ms,1.79ms,49.00μs,2.22ms,1.76ms
 16,hierarchical_v1.0,2026/07/31 11:41:36,185.10,pass,pass,pass,pass,pass,pass,pass,pass,pass,22.00μs,1.90ms,1.43ms,18.00μs,2.25ms,1.77ms,78.00μs,3.55ms,2.76ms
 5,ccu-v3.4,2026/07/31 13:57:02,191.68,pass,pass,pass,pass,pass,pass,pass,pass,pass,22.00μs,1.77ms,1.41ms,18.00μs,2.26ms,1.81ms,21.00μs,2.14ms,1.69ms
+9,ccu-3.5,2026/07/31 16:52:14,191.72,pass,pass,pass,pass,pass,pass,pass,pass,pass,22.00μs,1.80ms,1.37ms,18.00μs,2.29ms,1.80ms,21.00μs,2.17ms,1.69ms
