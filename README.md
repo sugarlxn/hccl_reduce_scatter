@@ -1,4 +1,6 @@
-# ReduceScatter 集合通信算子
+# 2026 HCCL通信库创新大赛粤港澳赛区[梦之队] ReduceScatter 集合通信算子
+
+[Gitcode_HCCL_PR](https://gitcode.com/cann/cann-ops-competitions/pull/894/commit)
 
 ## 1. 项目介绍
 
